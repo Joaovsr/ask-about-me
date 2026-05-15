@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.local
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+.vercel/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Local data / KB working copies
+data/kb/_drafts/
+data/embeddings_cache/
+
+# Secrets
+*.pem
+*.key
+.fly/
+.env*
+!.env.example
