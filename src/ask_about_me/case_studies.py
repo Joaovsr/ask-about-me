@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy import text
@@ -44,6 +45,10 @@ class _CaseStudyDraft:
 
 class CaseStudyNotFoundError(LookupError):
     pass
+
+
+class CaseStudyReader(Protocol):
+    async def get_current(self, slug: str) -> PublishedCaseStudy: ...
 
 
 class StaleCaseStudyRevisionError(RuntimeError):

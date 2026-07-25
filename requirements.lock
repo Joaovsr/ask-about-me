@@ -52,6 +52,8 @@ idna==3.18
     #   requests
 iniconfig==2.3.0
     # via pytest
+itsdangerous==2.2.0
+    # via ask-about-me (pyproject.toml)
 jiter==0.16.0
     # via openai
 librt==0.13.0

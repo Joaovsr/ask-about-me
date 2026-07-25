@@ -41,9 +41,17 @@ O Postgres de desenvolvimento fica restrito a `127.0.0.1:5432`, com pgvector hab
 
 - `GET /health/live`: processo FastAPI disponível.
 - `GET /health/ready`: processo e Postgres disponíveis.
+- `GET /case-studies/{slug}?locale=pt-BR|en-US`: conteúdo público localizado do
+  Case Study atual, incluindo sua revisão.
 - `POST /ask`: pipeline retrieve-then-generate completa. Com
   `AAM_OPENAI_API_KEY` configurada, a aplicação compõe automaticamente retrieval,
   embeddings e geração; sem a chave, responde `503` de forma explícita.
+- `POST /admin/session`, `GET /admin/csrf` e `/admin/case-studies`: primeiro
+  adapter do Painel admin. Configure `AAM_ADMIN_PASSWORD` e um
+  `AAM_ADMIN_SESSION_SECRET` longo para habilitá-lo. A sessão é HTTP-only e as
+  mutações exigem o token CSRF retornado por `/admin/csrf`. A publicação também
+  requer `AAM_OPENAI_API_KEY`; sem ela, login continua disponível, mas a API de
+  conteúdo responde que a publicação está indisponível.
 
 A Knowledge Base recebe KB Docs projetados, divide suas seções em chunks e gera embeddings
 por uma interface substituível. A reindexação grava uma geração candidata inativa, verifica
@@ -73,6 +81,12 @@ API:
 make reindex-openai
 make dev
 ```
+
+O primeiro corte do Painel admin permite publicar Case Studies bilíngues. A publicação
+usa a mesma transação de conteúdo e indexação: se a geração de embeddings ou a verificação
+do índice falhar, a revisão pública anterior permanece ativa. Em desenvolvimento, mantenha
+`AAM_ADMIN_COOKIE_SECURE=false`; o padrão da aplicação é `true` para exigir cookie
+de sessão seguro em produção HTTPS.
 
 O adapter usa `text-embedding-3-small` com 1.536 dimensões por padrão e envia os chunks em
 lotes. O chunker preserva os limites das seções, prefere fronteiras de parágrafo e frase e
