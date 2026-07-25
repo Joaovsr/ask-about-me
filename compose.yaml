@@ -1,0 +1,41 @@
+x-postgres: &postgres
+  image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+  environment:
+    POSTGRES_USER: ask_about_me
+    POSTGRES_PASSWORD: ask_about_me
+  healthcheck:
+    test:
+      [
+        "CMD-SHELL",
+        "PGPASSWORD=$${POSTGRES_PASSWORD} psql -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB} -tAc 'SELECT 1' | grep -qx 1",
+      ]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+
+services:
+  postgres:
+    <<: *postgres
+    environment:
+      POSTGRES_DB: ask_about_me
+      POSTGRES_USER: ask_about_me
+      POSTGRES_PASSWORD: ask_about_me
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  postgres-test:
+    <<: *postgres
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: ask_about_me_test
+      POSTGRES_USER: ask_about_me
+      POSTGRES_PASSWORD: ask_about_me
+    ports:
+      - "127.0.0.1:${AAM_TEST_POSTGRES_PORT:-5433}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+
+volumes:
+  postgres_data:

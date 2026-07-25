@@ -1,53 +1,123 @@
 # ask-about-me
 
-> Um agente IA que conhece minha trajetória técnica e responde, com citações, perguntas de recrutadores e clientes potenciais.
+Sistema de conteúdo e RAG do portfólio do João. Responde perguntas sobre sua trajetória técnica com evidências recuperadas de material publicado e citações visíveis.
 
-**Status:** 🟡 em planejamento (V1 spec definido, código ainda não iniciado)
+**Status:** base local e primeiro walking skeleton da pipeline RAG disponíveis.
 
----
+## V1
 
-## O que é
+- Chat real embutido no [portfólio Vue existente](https://github.com/joaovsr/joaovsr.github.io).
+- Perguntas livres e prompts sugeridos passam pelo mesmo fluxo de retrieval e geração.
+- Respostas completas com cards de citação e declaração explícita de evidência insuficiente.
+- Conteúdo público bilíngue gerenciado por um painel privado.
+- Postgres como fonte de verdade do portfólio e da Knowledge Base.
+- Indexação automática e consistente a cada publicação.
+- Conversa efêmera mantida apenas no navegador.
 
-Bot conversacional que vive no meu portfolio e responde perguntas sobre minha experiência técnica — mas com três diferenciais que separam de qualquer "RAG bot tutorial":
+## Arquitetura
 
-1. **`compare_to_role`**: recrutador cola a JD da vaga e o agente devolve um diagnóstico estruturado de fit, com evidências citadas dos meus projetos e 3 perguntas sugeridas pra entrevista.
-2. **Tool calls visíveis durante streaming**: você vê o agente pensando (`🔧 buscando experiência em RAG corporativo...`).
-3. **Conversão real**: tools `book_a_call` e `request_contact` transformam visita em conversa marcada, não em "tchau".
+- **Frontend público:** Vue 3, Vite e TypeScript no repositório do portfólio.
+- **Backend:** FastAPI com fluxo retrieve-then-generate explícito, sem framework de agente.
+- **Dados:** Postgres e pgvector.
+- **Avaliação e observabilidade:** Golden Dataset versionado e Langfuse.
+- **Infraestrutura:** portfólio, backend e banco no mesmo droplet da DigitalOcean.
+- **Modelos:** OpenAI como provedor inicial; modelos e parâmetros são validados com conteúdo real.
 
-## Stack
+O backend concentra três módulos: Conteúdo publicado, Knowledge Base e RAG de Portfólio. O frontend público, o painel admin e os handlers HTTP são adapters dessas interfaces.
 
-- **Backend**: FastAPI + [PydanticAI](https://ai.pydantic.dev/) + Anthropic Claude Sonnet 4.6
-- **Frontend**: Next.js 15 (App Router) + Vercel AI SDK
-- **Retrieval**: pgvector (Supabase) + hybrid search (BM25 + dense) + Cohere Rerank
-- **Infra**: Fly.io (backend) + Vercel (frontend) + Upstash Redis + Supabase Postgres
-- **Anti-abuse**: Cloudflare Turnstile + rate limit + daily budget cap
-- **Custo perpétuo**: ~$0/mês (free tiers + Claude pay-per-use limitado)
+## Desenvolvimento Local
 
-## Por que isso existe
+Pré-requisitos: Docker Desktop e Python 3.12 ou superior.
 
-Construí ~15 sistemas de IA em produção em empresa tradicional brasileira (cobrança, voice agents, RH, supply, governança, big data). Quase tudo privado por NDA.
+```bash
+make setup
+make db-up
+make migrate
+make seed-dev
+make dev
+```
 
-Este repo é a **versão pública e auditável** do que aprendi montando agentes corporativos em pt-BR. O código aqui demonstra os padrões que repeti N vezes em ambiente fechado.
+O Postgres de desenvolvimento fica restrito a `127.0.0.1:5432`, com pgvector habilitado por migration. Os testes criam um container efêmero separado em `127.0.0.1:5433`. A API roda em `http://127.0.0.1:8000` e expõe:
+
+- `GET /health/live`: processo FastAPI disponível.
+- `GET /health/ready`: processo e Postgres disponíveis.
+- `POST /ask`: pipeline retrieve-then-generate completa. Com
+  `AAM_OPENAI_API_KEY` configurada, a aplicação compõe automaticamente retrieval,
+  embeddings e geração; sem a chave, responde `503` de forma explícita.
+
+A Knowledge Base recebe KB Docs projetados, divide suas seções em chunks e gera embeddings
+por uma interface substituível. A reindexação grava uma geração candidata inativa, verifica
+o retrieval nela e só então troca o ponteiro ativo em uma transação. Se a preparação ou a
+verificação falhar, a geração anterior continua pesquisável. A busca `search_my_work`
+combina pgvector e full-text search em português por Reciprocal Rank Fusion. Geração e
+embeddings ficam atrás de interfaces estreitas para permitir o spike de provedor sem
+alterar os módulos de Knowledge Base e RAG de Portfólio.
+
+O primeiro seed versionado é um Case Study da plataforma de gestão de pessoas com IA. A
+revisão mantém campos explícitos em `pt-BR` e `en-US`; sua projeção determinística usa
+apenas título e seções em `pt-BR` como texto canônico do KB. A publicação prepara os
+embeddings antes e confirma revisão, ponteiro público e geração do índice na mesma
+transação, evitando conteúdo publicado sem evidência pesquisável. A nova geração substitui
+somente as origens alteradas e preserva os demais KB Docs ativos, independentemente do
+`doc_type`.
+
+`make seed-dev` é idempotente e usa embeddings hash locais apenas para desenvolvimento.
+Eles não substituem a avaliação nem os modelos do provedor de produção; ao configurar o
+provedor escolhido, o conteúdo deve ser reindexado antes de servir tráfego.
+
+Para usar a pipeline real da OpenAI, copie as configurações de `.env.example`, preencha
+`AAM_OPENAI_API_KEY` somente no `.env` ignorado pelo Git, reindexe o conteúdo e inicie a
+API:
+
+```bash
+make reindex-openai
+make dev
+```
+
+O adapter usa `text-embedding-3-small` com 1.536 dimensões por padrão e envia os chunks em
+lotes. O chunker preserva os limites das seções, prefere fronteiras de parágrafo e frase e
+usa inicialmente alvo de 350 tokens, máximo de 500 e overlap de até 50 tokens. Cada geração
+do índice registra provider, modelo, dimensões e versão do chunker; uma configuração
+incompatível exige reindexação em vez de misturar vetores.
+
+A geração usa a Responses API com Structured Outputs e `gpt-5.6-sol` por padrão. O modelo
+recebe apenas a pergunta, o histórico efêmero e os chunks recuperados como dados não
+confiáveis. Ele devolve claims atômicas tipadas e IDs de chunks; o servidor valida
+autoridade, citações e se todos os tipos solicitados pela pergunta foram atendidos, tenta
+uma correção estruturada quando necessário e hidrata os metadados finais. As respostas não
+são armazenadas pela OpenAI via `store`, e timeout, retries, modelo e limite de saída podem
+ser ajustados pelas variáveis `AAM_OPENAI_*` e `AAM_GENERATION_*` do `.env.example`.
+
+Para executar todos os checks locais:
+
+```bash
+make check
+```
+
+`make db-down` encerra os containers preservando os dados. `make db-reset` também remove o volume local.
+
+## Evidência
+
+- Case Studies sustentam experiência prática.
+- Profile Docs sustentam claims auto-declarados com menor força factual.
+- Essays sustentam opiniões técnicas, não entregas realizadas.
+- Toda afirmação factual substantiva precisa de citação.
+- Sem evidência suficiente, o sistema responde parcialmente ou declara a limitação.
 
 ## Documentação
 
-- [docs/SPEC.md](docs/SPEC.md) — Especificação técnica completa do V1
-- [docs/DECISIONS.md](docs/DECISIONS.md) — Log das decisões de design e por quê (ADR-style)
+- [CONTEXT.md](CONTEXT.md): linguagem canônica do domínio.
+- [docs/SPEC.md](docs/SPEC.md): especificação vigente do V1.
+- [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md): plano de execução em fatias verticais.
+- [docs/adr/](docs/adr/): decisões arquiteturais e seus trade-offs.
 
-## Roadmap
+## Fora Do V1
 
-**V1 (3 semanas)** — escopo deste repo:
-- 4 tools (`search_my_work`, `compare_to_role`, `book_a_call`, `request_contact`)
-- Production-grade retrieval
-- pt-BR + tradução por modelo
-- Citations + tool calls visíveis
-
-**V2 (depois de tração)**:
-- Cal.com OAuth real
-- LinkedIn OAuth opcional ("premium feel")
-- Voice via Anthropic Realtime
-- GitHub crawler automático
-- Tools adicionais: `share_link`, `code_sample`
+- Comparação estruturada com vagas e `compare_to_role`.
+- Booking, captura de contatos e integrações de calendário.
+- Streaming de tokens e tool calls visíveis.
+- Sessões ou analytics persistentes de conversas.
+- Voice, multiagente e crawler automático do GitHub.
 
 ## License
 

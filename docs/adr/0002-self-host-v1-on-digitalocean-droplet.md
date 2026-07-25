@@ -1,0 +1,3 @@
+# Self-host V1 on a DigitalOcean droplet
+
+V1 will run on a DigitalOcean droplet instead of splitting the portfolio across GitHub Pages/Vercel and a managed database. The droplet will host the portfolio, the `/ask` API, and a local Postgres with `pgvector`; runtime application dependencies are limited to the model provider, while DNS and off-droplet backups remain operational dependencies. Provisioning happens only after the complete pipeline passes its local quality gates, keeping cloud setup out of the implementation critical path. This keeps the RAG experience self-contained and avoids Supabase/Vercel as required runtime infrastructure for the first version, at the cost of managing the server, deploy process, backups, and uptime.

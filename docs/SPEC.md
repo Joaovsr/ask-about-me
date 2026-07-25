@@ -1,294 +1,333 @@
-# SPEC — ask-about-me V1
+# Especificação do V1
 
-> Documento de especificação técnica do V1. Derivado de uma sessão de grilling com Claude
-> (skill `grill-me`) em 2026-05-13.
+Esta é a especificação vigente do `ask-about-me`. O vocabulário canônico está em [`CONTEXT.md`](../CONTEXT.md), e decisões difíceis de reverter estão registradas em [`docs/adr/`](adr/).
 
----
+## 1. Resultado esperado
 
-## 1. Objetivo e usuário-alvo
+O V1 transforma o portfólio público do João em uma experiência de RAG confiável para recrutadores técnicos e clientes potenciais. O visitante deve conseguir fazer uma pergunta sobre trajetória, projetos, competências ou opiniões técnicas e receber uma resposta fundamentada em conteúdo publicado, com evidências verificáveis.
 
-**Objetivo:** quick win shippable em ~3 semanas. Bot público que demonstra padrões técnicos
-modernos (PydanticAI, hybrid retrieval, agent com tools, observability) usando como vetor
-a experiência real de quem construiu agentes IA em produção numa empresa tradicional brasileira.
+O sistema também substitui os arquivos estáticos do portfólio por um pequeno sistema de conteúdo bilíngue, administrado sem commits e usado como origem da Knowledge Base.
 
-**Usuário primário:** Recrutador técnico (BR + internacional).
+## 2. Escopo
 
-**Usuário secundário:** Cliente freelance/consultoria potencial.
+O V1 inclui:
 
-**Não-usuários (V1):** Devs curiosos buscando deep-dive técnico (ficam no GitHub README do repo,
-não interagem com o bot); o próprio João como "segundo cérebro" (separado).
+- Portfólio Vue existente consumindo conteúdo publicado por HTTP.
+- Conteúdo explícito em `pt-BR` e `en-US`.
+- Painel admin privado para um único proprietário.
+- Publicação imediata e consistente com a indexação.
+- KB derivada do conteúdo publicado em `pt-BR`.
+- Retrieval vetorial e textual atrás de uma única interface.
+- Chat embutido com perguntas livres e prompts sugeridos.
+- Respostas completas com cards de citação.
+- Respostas parciais ou recusa quando não houver evidência suficiente.
+- Histórico efêmero mantido no navegador.
+- Deploy do portfólio, backend e Postgres/pgvector em um droplet da DigitalOcean.
 
-## 2. Base de conhecimento (KB)
+O V1 não inclui:
 
-**Escopo:** ~25 documentos curados em pt-BR.
+- `compare_to_role`, parsing de vagas ou score de aderência.
+- Booking, captura de contatos ou integrações de calendário.
+- Streaming de tokens ou exposição de tool calls.
+- Persistência ou analytics de conversas.
+- Drafts, aprovação editorial ou agendamento de publicação.
+- Voice, múltiplos agentes, crawler do GitHub ou reranker externo sem evidência de necessidade.
 
-**Composição:**
-- 1 CV.md
-- ~10 case-studies dos projetos (1 por projeto da Fictor, anonimizados onde NDA exigir)
-- 5-8 opinion pieces técnicas (ver §11)
-- 3-5 LinkedIn posts (reaproveitar `gestao-pessoas/linkedin-*.md`)
-- 1 skills-matrix.md
+## 3. Limites do sistema
 
-**Constraint LGPD/NDA:** zero código-fonte da Fictor. Descrições de alto nível, decisões de arquitetura,
-patterns reusáveis — sim. Snippets proprietários — não.
+O trabalho abrange dois repositórios:
 
-**Pipeline de ingestão:**
-1. Markdown em `data/kb/*.md`
-2. Chunking semântico (não fixed-size dumb) — ver §6
-3. Embeddings via OpenAI `text-embedding-3-small` ou Voyage AI
-4. Upload pra pgvector
-5. Reindex via comando `make reindex` (idempotente)
-
-## 3. Arquitetura
-
-**Nível 2: agente com tools** (não multi-agente; não RAG puro).
-
-```
-┌──────────────────┐         ┌──────────────────────────┐
-│  Next.js 15      │ ──HTTP─▶│  FastAPI                 │
-│  (Vercel)        │ ◀─SSE──│  ├─ /chat (streaming)    │
-│  Vercel AI SDK   │         │  ├─ /admin (basic auth)  │
-└──────────────────┘         │  └─ /health              │
-                             │                          │
-                             │  PydanticAI Agent        │
-                             │  ├─ search_my_work       │
-                             │  ├─ compare_to_role      │
-                             │  ├─ book_a_call          │
-                             │  └─ request_contact      │
-                             └──┬──────┬──────┬─────────┘
-                                │      │      │
-                       ┌────────▼┐ ┌───▼───┐ ┌▼────────┐
-                       │ pgvector│ │ Redis │ │ Postgres│
-                       │(Supabase)│ │Upstash│ │(Supabase)│
-                       └─────────┘ └───────┘ └─────────┘
-                                │
-                                ▼
-                         ┌──────────────┐
-                         │ Anthropic    │
-                         │ Claude 4.6   │
-                         │ + Cohere     │
-                         │   Rerank     │
-                         └──────────────┘
-```
-
-## 4. Stack
-
-| Camada | Tecnologia | Por quê |
-|---|---|---|
-| LLM | Anthropic Claude Sonnet 4.6 | Melhor pt-BR; tool_use API limpa; diversifica vs Azure |
-| Agent framework | PydanticAI | Typed, moderno; sinal de "estuda o que vem depois" |
-| Embeddings | OpenAI `text-embedding-3-small` | Custo baixo, qualidade comprovada |
-| Reranker | Cohere Rerank v3 (free tier) | Baseline production-grade |
-| Vector DB | pgvector (Supabase free) | Postgres familiar + FTS no mesmo DB |
-| Backend | FastAPI | Python + ecossistema PydanticAI |
-| Frontend | Next.js 15 App Router + Vercel AI SDK | Streaming nativo, deploy free, diversifica do CV |
-| Backend host | Fly.io free always-on | Sem cold start, edge global, sem lock Azure |
-| Frontend host | Vercel | Padrão Next.js |
-| Session store | Upstash Redis (free) | Serverless, REST, free tier perpétuo |
-| Auth admin | Basic Auth | João é o único admin |
-| Anti-bot | Cloudflare Turnstile | Captcha invisível |
-
-## 5. Tools do agente
-
-### 5.1 `search_my_work(query: str, top_k: int = 5)`
-RAG sobre o KB. Retorna `list[Chunk]` com `text`, `source_doc`, `score`. Usado em quase toda resposta.
-
-### 5.2 `compare_to_role(jd_text: str)` ⭐
-**Killer feature.** Recrutador cola a JD da vaga. Pipeline:
-1. Claude extrai requirements estruturados (Pydantic schema forçado).
-2. Pra cada requirement, faz RAG no KB.
-3. Classifica cada requirement: ✅ atende (com evidências), ⚠️ parcial, ❌ gap.
-4. Retorna `FitAnalysis` com fit_score (0-100), strengths, gaps, suggested_interview_questions[].
-
-**Risco:** alucinação. Mitigação: few-shot examples + saída estruturada + cada requirement
-ancorado em evidência citada do KB (sem evidência = ⚠️ ou ❌, nunca ✅).
-
-### 5.3 `book_a_call(name: str, email: str, time_window: str, context: str)`
-V1 modo notificação simples:
-- Validação básica (email format, não vazio)
-- Envia Telegram pro João via bot token + chat_id
-- Persiste em Postgres tabela `bookings`
-- Retorna confirmação com mensagem "te respondo em 24h"
-
-**V2:** Cal.com OAuth real.
-
-### 5.4 `request_contact(name: str, role: str, message: str, channel: str)`
-Fallback de conversão pra quem não quer marcar call. Mesma pipeline que `book_a_call`,
-status diferente. Telegram + Postgres.
-
-## 6. Retrieval (production-grade)
-
-**Chunking:**
-- Markdown-aware: split por `##` headings primeiro
-- Chunks alvo: 400-800 tokens
-- Overlap: 50 tokens
-- Preserve metadata: `source_doc`, `section`, `tags`
-
-**Indexing:**
-- Embedding por chunk: `text-embedding-3-small` (1536 dim)
-- Também guardar texto raw em `content` (pra BM25/FTS)
-- Postgres FTS index em `content` com config `portuguese`
-
-**Query time:**
-1. **Dense**: `query embedding ⟷ chunks` via pgvector cosine, top-K=20
-2. **Sparse**: Postgres FTS `to_tsquery('portuguese', query)`, top-K=20
-3. **Merge**: união, dedup por chunk_id
-4. **Rerank**: Cohere Rerank v3 com query + chunks → top-5
-5. **Stuff** os top-5 no prompt do agente
-
-**Por que não Ragas/eval suite:** escala de 25 docs não justifica. V2 se a base crescer.
-
-## 7. Idioma
-
-**Estratégia:** KB 100% pt-BR. Claude detecta idioma da pergunta no system prompt e responde
-no mesmo idioma do user. Citações ficam em pt-BR (idioma da fonte) com tradução inline se a
-conversa for em inglês.
-
-**Justificativa:** Claude 4.6 traduz pt-BR corporativo sem perder nuance técnica. Custo extra zero.
-
-## 8. UI/Observabilidade
-
-**Stack visual:** Next.js + Tailwind + shadcn/ui + Vercel AI SDK (streaming).
-
-**Elementos visíveis:**
-
-1. **Citations inline:** cada afirmação fatual com footnote `[1]` clicável. Footnote expande popup
-   com `source_doc`, trecho destacado, link pra doc completo.
-2. **Tool calls durante streaming:**
-   - `🔧 buscando em projetos sobre RAG...` (search_my_work)
-   - `🎯 comparando com a vaga...` (compare_to_role)
-   - `📅 registrando interesse em call...` (book_a_call)
-   - `✉️ encaminhando contato...` (request_contact)
-3. **Botão "Ver trace técnico":** abre modal com:
-   - Chunks recuperados (texto + score)
-   - Tool calls + args + responses (JSON)
-   - Tokens used + custo USD aproximado
-   - Tempo de cada step
-
-**Disclaimer fixo no rodapé:**
-> Conversas são armazenadas anonimamente (com redação de PII) para análise.
-> [Política de privacidade]
-
-## 9. Anti-abuse + custo
-
-**Camadas (defense in depth):**
-
-1. **Cloudflare Turnstile invisible** no frontend antes do POST `/chat`. Token validado no backend.
-2. **Rate limit por IP**: 10 mensagens / 5min (slowapi + Redis backend).
-3. **Daily budget cap absoluto**: wrapper em torno do Anthropic SDK. Lê `spent_today_usd`
-   do Redis; se passar de $5/dia, dispara `HTTPException(429, "daily budget exhausted")`.
-4. **Per-IP daily message cap**: 50 mensagens/dia/IP (paranoid mode).
-
-**Métricas Redis:**
-- `budget:YYYY-MM-DD` → cents spent today (TTL 48h)
-- `rate:ip:{ip}:5min` → counter (TTL 5min)
-- `daily:ip:{ip}:YYYY-MM-DD` → counter (TTL 48h)
-
-## 10. Sessão + analytics
-
-**Sessão:**
-- httpOnly cookie `aam_sid` (random UUID, TTL 24h)
-- Mensagens da sessão em Redis: `session:{sid}` → JSON array (TTL 24h)
-- Refresh dentro de 24h mantém contexto
-
-**Analytics:**
-- Tabela Postgres `conversations` (anonymized): id, started_at, ended_at, message_count, ip_hash
-- Tabela `messages`: conversation_id, role, content, tools_called, citations, created_at
-- **PII redaction antes do insert**: regex pra emails, telefones BR, CPF, CNPJ + Claude redactor pra free-form. Reusar lógica do projeto `pesquisa-clima`.
-- IP hash = SHA-256(IP + salt secret), não IP cru
-
-**`/admin` route:**
-- Basic Auth (env var)
-- Queries SQL pré-definidas:
-  - Top 20 perguntas dessa semana
-  - Tools mais usadas
-  - Conversões (bookings + contacts)
-  - Custo diário
-- ~20 linhas FastAPI + 1 template Jinja
-
-## 11. Opinion pieces (o gargalo real)
-
-Os 5-8 opinion pieces são o asset mais valioso e o que mais facilmente vira meia-boca. Cada um
-deve ter ~1500 palavras, opinião forte, exemplo concreto da Fictor (anonimizado), e DEVE virar
-post no LinkedIn separadamente.
-
-**Lista sugerida (alinhada à experiência real):**
-
-1. **"5 erros que cometi construindo RAG em pt-BR pra empresa tradicional brasileira"**
-   — chunking ingênuo, embeddings que não entendem jargão fiscal, retrieval sem rerank, etc.
-2. **"Embeddings de transcrições do Microsoft Teams: o que aprendi avaliando comportamento de funcionários com IA"**
-   — case real do projeto gestao-pessoas, viés ético, sinal vs ruído.
-3. **"PII masking em pt-BR: o que LGPD exige e os tutoriais americanos não te contam"**
-   — case do pesquisa-clima, CPF/CNPJ/RG, regex vs LLM redactor.
-4. **"Construindo agentes que falam com ERP brasileiro via MCP: a saga TOTVS/Protheus"**
-   — case anonimizado do projeto cobrança.
-5. **"Multi-agente é over-engineering 9 em 10 vezes — quando vale e quando não vale"**
-   — opinião contrarian, exemplos de quando você usou e quando NÃO usou.
-6. **"Azure OpenAI vs Anthropic vs OpenAI em produção: 6 meses depois"**
-   — comparação honesta, latência, qualidade pt-BR, custo, lock-in.
-7. **"Pesquisa de clima com IA: por que classificação supervisionada perdeu pra zero-shot LLM"**
-   — case do pesquisa-clima.
-8. **"Voz em pt-BR pra agente de call center: o que ninguém te conta sobre Twilio + Azure Realtime"**
-   — case do callcenter, latência percebida, jitter, transcrição.
-
-**Tempo realista:** 3-4h por peça → 24-32h total de escrita. Espalhar pelas 3 semanas.
-
-## 12. Cronograma (3 semanas)
-
-| Dia | Tarefa |
+| Repositório | Responsabilidade |
 |---|---|
-| D1-2 | Escrever KB inicial (CV + ~10 case-studies + 3 opinion pieces dos 8 — resto vem ao longo do projeto) |
-| D3 | Pipeline ingestão (chunking, embeddings, upload pgvector) |
-| D4 | FastAPI base (/chat, /admin, /health) + Supabase + Upstash setup |
-| D5 | PydanticAI agent + 4 tools com mock |
-| D6-7 | Hybrid search + Cohere Rerank + medir qualidade subjetiva |
-| D8 | Tools reais: `compare_to_role` (prompt engineering pesado) + `book_a_call` (Telegram) + `request_contact` |
-| D9 | Next.js + Vercel AI SDK + UI básica |
-| D10 | Streaming com citations + tool calls visíveis |
-| D11 | Turnstile + slowapi + budget cap wrapper |
-| D12 | Cookie+Redis session + PII redaction + log Postgres |
-| D13 | /admin dashboard básico |
-| D14 | Deploy: `fly deploy` + Vercel + DNS (askjoao.dev ou similar) |
-| D15 | README polish: Deploy-buttons + GIF demo + screenshots |
-| D16 | Soft launch: post LinkedIn com `compare_to_role` em ação |
-| D17-21 | Buffer / restantes opinion pieces / itera baseado em primeiros usos |
+| `joaovsr.github.io` | Portfólio Vue/Vite, carregamento de conteúdo público, chat embutido e renderização das citações. |
+| `ask-about-me` | FastAPI, painel admin, conteúdo publicado, Knowledge Base, RAG, persistência e operações do backend. |
 
-## 13. Riscos e mitigações
+Em produção, os dois são servidos na mesma origem. O reverse proxy entrega o build estático do portfólio e encaminha as rotas do backend antes do fallback da SPA.
 
-| Risco | Probabilidade | Mitigação |
-|---|---|---|
-| PydanticAI rough edge em streaming tool calls | Média | Validar em D5; fallback = Anthropic SDK direto |
-| `compare_to_role` alucina sobre fit | Alta | Few-shot examples + saída estruturada + ancoragem obrigatória em chunks citados |
-| Opinion pieces não saem | Alta | Lançar com 3 prontos; resto na vibe, sem bloquear V1 |
-| Cohere free tier estoura | Baixa | Fallback bge-reranker local (CPU) |
-| Bill shock por bug | Baixa | Budget cap absoluto faz hard stop em $5/dia |
-| Cold start mata UX | Baixa | Fly free always-on resolve |
-| Crawler hostil dos modelos abertos | Média | robots.txt + Turnstile + rate limit |
+### 3.1 Módulos
 
-## 14. Escopo cortado de V1 (vai pra V2)
+**Conteúdo publicado**
 
-- Voice (Twilio + Anthropic Realtime)
-- Cal.com OAuth real
-- LinkedIn OAuth opcional
-- Multi-agente com handoff visível
-- Crawler dinâmico do GitHub público
-- Tools: `get_resume_pdf` (substituído por botão direto no UI), `code_sample`, `share_link`, `escalate_to_human`
-- Ragas eval suite
-- A/B test de prompts
-- i18n manual (currently via Claude)
+Interface responsável por consultar o snapshot público atual e publicar uma alteração validada. Esconde tabelas, traduções, ordenação e controle de versão dos callers.
 
-## 15. Launch (soft)
+**Knowledge Base**
 
-**Estratégia escolhida:** soft launch + post LinkedIn. Sem Hacker News (risco de queimar budget).
+Interface responsável por projetar conteúdo em KB Docs, substituir chunks e embeddings e executar `search_my_work`. Esconde chunking, pgvector, full-text search e ranking.
 
-**Sequência D16:**
-1. Repo público no GitHub (`joaovsr/ask-about-me` ou similar)
-2. Domínio `askjoao.dev` (ou similar) apontando pra Vercel
-3. Botão "Chat com meu agente IA" no `joaovsr.github.io`
-4. Post LinkedIn com GIF mostrando `compare_to_role` rodando + link
-5. Mensagem direta pra 10-15 pessoas-chave da rede com link
+**RAG de Portfólio**
 
-**Métrica de sucesso V1 (4 semanas pós-launch):**
-- ≥ 50 conversas de pessoas reais (não você testando)
-- ≥ 5 `book_a_call` ou `request_contact` reais
-- ≥ 1 conversa que vire entrevista real
+Interface conceitual `answer(question, locale, history) -> complete answer`. Sempre recupera evidências antes de gerar e concentra as regras de autoridade, evidência insuficiente e integridade das citações.
+
+**Adapters**
+
+O portfólio Vue, o painel admin e os handlers HTTP apenas traduzem suas entradas para as interfaces dos módulos. Regras de publicação, retrieval ou evidência não pertencem aos adapters.
+
+## 4. Conteúdo publicado
+
+### 4.1 Entidades
+
+O sistema administra:
+
+- Profile
+- Experience
+- Project
+- Skill
+- Education
+- Certification
+- Case Study
+- Essay
+- Suggested Prompt
+
+Textos de interface, labels de botões e mensagens genéricas continuam nos arquivos de localização do frontend. Eles não são conteúdo publicado nem entram na KB.
+
+### 4.2 Identidade e estrutura
+
+Toda entidade possui:
+
+- ID interno estável.
+- Slug público estável e único dentro do tipo.
+- Posição explícita de exibição quando fizer parte de uma coleção ordenada.
+- Versão usada para detectar edições concorrentes e identificar a origem de citações.
+- Timestamps de criação e alteração.
+- Campos localizados explícitos em `pt-BR` e `en-US` quando houver texto público.
+
+Relacionamentos usam IDs estáveis, nunca nomes exibidos. Ícones são representados por chaves conhecidas pelo frontend, não por componentes Vue serializados.
+
+Cada publicação bem-sucedida cria uma revisão imutável e move o ponteiro da versão atual. Revisões anteriores permanecem disponíveis para resolver citações versionadas enquanto a entidade estiver publicada; elas são histórico, não drafts editáveis.
+
+O estado `private` de um Project descreve a visibilidade de seu repositório ou entrega. Ele não representa estado editorial, pois todo registro retornado pela interface pública já está publicado.
+
+### 4.3 Mídia
+
+Imagens possuem identidade, URL pública, ordem e texto alternativo localizado. No V1, uploads ficam em armazenamento persistente do droplet e fazem parte da política de backup. Binários e caminhos de arquivo não são indexados no KB.
+
+### 4.4 Localização
+
+`pt-BR` e `en-US` são obrigatórios para a publicação de campos localizados. O frontend pede apenas o locale ativo e usa `pt-BR` como fallback defensivo, não como substituto para uma tradução ausente no momento da publicação.
+
+O idioma solicitado pelo frontend determina o idioma da resposta do RAG. As evidências e seus links canônicos permanecem no `pt-BR` original no V1, mesmo em uma resposta em inglês.
+
+## 5. Projeção para a Knowledge Base
+
+A projeção determinística converte conteúdo publicado em KB Docs:
+
+| Conteúdo | `doc_type` resultante |
+|---|---|
+| Case Study | `case_study` |
+| Essay | `essay` |
+| Profile | `profile` |
+| Cada Experience | `profile` |
+| Cada Project | `profile` |
+| Cada Skill | `profile` |
+| Cada Education | `profile` |
+| Cada Certification | `profile` |
+
+Um Project pode estar relacionado a um Case Study, mas seu resumo continua sendo um Profile Doc. Apenas conteúdo explicitamente publicado como Case Study recebe a força factual de experiência prática.
+
+Suggested Prompts, textos de interface, dados de contato, caminhos de mídia e metadados operacionais não são indexados.
+
+Cada KB Doc registra:
+
+- ID e revisão de uma única entidade de origem.
+- `doc_type`.
+- Título e slug públicos.
+- Seção lógica.
+- Texto canônico em `pt-BR`.
+- Chunks e embeddings derivados.
+- Geração do índice, separada da revisão do conteúdo de origem.
+
+## 6. Publicação consistente
+
+Salvar no painel admin executa uma única operação lógica:
+
+1. Validar estrutura, relacionamentos e as duas localizações.
+2. Construir a projeção em `pt-BR` dos conteúdos afetados.
+3. Gerar chunks e embeddings antes de substituir a versão pública.
+4. Confirmar a revisão imutável, o ponteiro atual, a versão do snapshot, os KB Docs e os chunks juntos no Postgres.
+
+Se validação, embedding ou persistência falhar, a alteração não é publicada e a versão anterior continua atendendo tanto o portfólio quanto o RAG. O painel apresenta o erro sem criar um draft implícito.
+
+O V1 não mantém cache de conteúdo no backend. O snapshot usa sua versão transacional como ETag, portanto uma publicação não depende de uma etapa falível de invalidação.
+
+Exclusões obedecem à mesma regra e removem os derivados da KB junto com o conteúdo atual. Revisões de uma entidade excluída deixam de ser publicamente acessíveis. Uma reindexação completa de recuperação fica vinculada à versão do snapshot que leu, constrói uma nova geração de KB em paralelo e só troca o ponteiro ativo se essa versão ainda for a atual. Se houver publicação concorrente, a geração candidata é descartada e refeita; o índice vigente nunca é apagado antes do sucesso.
+
+## 7. Retrieval
+
+O módulo Knowledge Base expõe uma única operação `search_my_work`. Sua implementação inicial combina:
+
+- Busca vetorial com pgvector.
+- Full-text search do Postgres para o conteúdo em português.
+- Deduplicação e ranking dos resultados.
+
+Cada resultado inclui pelo menos:
+
+- ID do chunk.
+- ID e versão do KB Doc.
+- `doc_type`.
+- Título e seção.
+- Trecho original.
+- Identidade e URL do conteúdo público de origem.
+- Score interno para ranking.
+
+Scores não precisam ser exibidos ao visitante. Chunk size, overlap, top-K, pesos e thresholds são parâmetros calibrados com uma coleção de perguntas esperadas, não contratos públicos.
+
+V1 usa um único provedor externo para geração e embeddings. Reranking só pode executar localmente ou pelo provedor já escolhido e apenas se uma avaliação mostrar ganho relevante sobre pgvector e full-text search. Adicionar outro serviço exige revisão explícita do ADR 0002.
+
+## 8. Geração fundamentada
+
+O backend usa FastAPI e orquestra explicitamente o fluxo:
+
+1. Validar pergunta, locale e histórico recebido.
+2. Recuperar evidências novamente para a pergunta atual.
+3. Pedir ao modelo itens ordenados, cada claim contendo uma única afirmação substantiva e IDs de chunks recuperados.
+4. Validar todos os IDs, a atomicidade do claim e a autoridade permitida para todas as suas citações.
+5. Hidratar no servidor títulos, excerpts, versões e URLs das citações válidas.
+6. Retornar a resposta completa com claims, limitações e cards deduplicados.
+
+O histórico ajuda a interpretar referências como "e nesse projeto?", mas mensagens anteriores do assistente nunca são evidência. O servidor não persiste o histórico.
+
+O modelo não cria metadados de citação. Ele apenas referencia chunk IDs apresentados no contexto; todos os demais campos vêm do Postgres. Um claim não pode combinar afirmações independentes no mesmo texto. Se a saída não passar na validação após a tentativa de correção configurada, o backend retorna `insufficient` em vez de entregar claims sem suporte.
+
+### 8.1 Estados da resposta
+
+- `answered`: há evidência suficiente para responder ao núcleo da pergunta.
+- `partial`: apenas parte da pergunta possui sustentação e a limitação é declarada.
+- `insufficient`: não há evidência suficiente para uma resposta factual útil.
+
+Experiência prática e opinião técnica podem coexistir, desde que a resposta diferencie explicitamente as duas.
+
+Cada claim obedece à seguinte matriz:
+
+| Tipo de claim | Evidência obrigatória | Citações permitidas | Regra |
+|---|---|---|---|
+| `experience` | Pelo menos um `case_study` | `case_study` e `profile` | Pode afirmar execução, entrega ou liderança; Profile Docs apenas corroboram. |
+| `profile` | Pelo menos um `profile` | Somente `profile` | Deve ser apresentado como informação do perfil publicado, não como entrega comprovada. |
+| `opinion` | Pelo menos um `essay` | Somente `essay` | Deve ser rotulado como opinião ou tese do João. |
+
+Limitações são itens separados, não claims, não possuem citações e não podem introduzir fatos. Uma pergunta sobre perfil pode ser `answered` apenas com claims `profile`. Uma pergunta que exige experiência prática fica no máximo `partial` quando só existem Profile Docs. `insufficient` é obrigatório quando não existe nenhum claim substantivo válido.
+
+### 8.2 Contrato de `/ask`
+
+Exemplo de request:
+
+```json
+{
+  "question": "Qual foi sua experiência construindo sistemas RAG?",
+  "locale": "pt-BR",
+  "history": [
+    { "role": "user", "content": "Em quais setores você trabalhou?" },
+    { "role": "assistant", "content": "Trabalhei principalmente..." }
+  ]
+}
+```
+
+Exemplo de response:
+
+```json
+{
+  "status": "answered",
+  "answerItems": [
+    {
+      "kind": "claim",
+      "claimType": "experience",
+      "text": "João construiu...",
+      "citationIds": ["citation-id"]
+    }
+  ],
+  "citations": [
+    {
+      "id": "citation-id",
+      "documentId": "kb-doc-id",
+      "documentVersion": 3,
+      "documentType": "case_study",
+      "title": "RAG para operações corporativas",
+      "section": "Resultado",
+      "excerpt": "Trecho original em português...",
+      "sourceUrl": "/case-studies/rag-operacoes?locale=pt-BR&version=3"
+    }
+  ]
+}
+```
+
+O servidor limita tamanho da pergunta, quantidade de turnos e payload total. A API usa JSON em `camelCase` para alinhar com o cliente TypeScript; o adapter HTTP faz a conversão para os modelos internos do backend.
+
+## 9. Portfólio público
+
+O frontend recebe um snapshot agregado por locale, adequado à página única atual. O snapshot inclui uma versão usada como ETag; o backend sempre valida essa versão contra o ponteiro atual no Postgres.
+
+A migração preserva a linguagem visual existente e adiciona estados explícitos de loading, vazio e erro. Uma falha na API não pode produzir dados antigos silenciosamente como se ainda fossem canônicos.
+
+O chat oferece:
+
+- Campo para pergunta livre.
+- Prompts sugeridos que chamam `/ask`.
+- Histórico visual da visita atual.
+- Estado de espera compatível com resposta completa.
+- Erros recuperáveis para timeout, indisponibilidade e limite de uso.
+- Cards de citação abaixo de cada resposta.
+- Acessibilidade por teclado, gerenciamento de foco e anúncio das respostas.
+
+A animação atual pode ser reaproveitada como indicação visual genérica de processamento, mas não pode alegar streaming, modelo específico, scores fictícios ou etapas que não representem o fluxo real.
+
+## 10. Painel admin
+
+O painel é um adapter privado servido pelo backend e voltado a um único proprietário. Não existe cadastro, organização, papéis ou permissão granular no V1.
+
+O painel permite:
+
+- Criar, editar, reordenar e excluir todas as entidades publicadas.
+- Editar `pt-BR` e `en-US` lado a lado.
+- Fazer upload e ordenar mídia.
+- Visualizar erros de validação ou indexação sem alterar a versão pública.
+- Detectar tentativa de salvar sobre uma versão já alterada.
+
+Autenticação usa uma credencial de proprietário armazenada como secret, sempre sobre TLS. Operações mutáveis têm proteção contra CSRF e não expõem credenciais ou chaves de modelos ao navegador.
+
+## 11. Migração inicial
+
+Os arquivos atuais do portfólio são uma fonte de importação única, não uma segunda fonte permanente. Antes da importação, claims divergentes entre `pt-BR`, `en-US`, metadados, PDF e RAG simulado devem ser revisados.
+
+A migração deve:
+
+- Preservar slugs e ordem quando forem semanticamente corretos.
+- Criar slugs estáveis onde hoje existem apenas IDs numéricos.
+- Converter relações de Skills por nome em relações por ID.
+- Converter componentes Vue de ícones em chaves serializáveis.
+- Separar status de privacidade de projeto de qualquer conceito editorial.
+- Importar metadados e alt text das imagens existentes.
+- Remover respostas e chunks fictícios do RAG.
+- Adaptar o gerador de currículo para usar o snapshot publicado.
+- Eliminar imports de dados estáticos depois da verificação de paridade.
+
+## 12. Segurança e operações
+
+Antes da exposição pública, o sistema precisa de:
+
+- Limites por origem, tamanho, frequência e concorrência no `/ask`.
+- Limite configurável de gasto diário com o provedor.
+- Timeouts e respostas seguras para falhas externas.
+- Secrets apenas no backend.
+- Logs operacionais sem conteúdo integral das conversas.
+- Traces de retrieval e geração no Langfuse com retenção e redação compatíveis com a natureza efêmera da conversa.
+- Avaliação versionada por Golden Dataset, cobrindo retrieval, autoridade, citações e estados da resposta sem comparação textual exata.
+- Health checks para aplicação e banco.
+- Migrations aplicadas de forma controlada antes da nova versão.
+- Backups externos criptografados do Postgres e da mídia.
+- Restauração testada, não apenas backup configurado.
+- Estratégia de rollback do deploy e das migrations compatíveis.
+- TLS, monitoramento básico de disponibilidade e renovação automática de certificados.
+
+## 13. Critérios de conclusão
+
+O V1 está pronto quando:
+
+- Todo conteúdo público do portfólio vem do Postgres nos dois locales.
+- Não existe fonte estática concorrente para dados de domínio.
+- Um admin consegue publicar conteúdo sem commit, e uma falha de indexação preserva a versão anterior.
+- Toda pergunta, inclusive prompt sugerido, percorre retrieval e geração reais.
+- Todo claim contém uma única afirmação e referencia apenas citações válidas, compatíveis com sua autoridade e navegáveis até a revisão em `pt-BR`.
+- Perguntas sem suporte produzem `partial` ou `insufficient`, sem completar lacunas com conhecimento geral.
+- Follow-ups funcionam com histórico enviado pelo navegador e nenhuma conversa é persistida no servidor.
+- O portfólio funciona em desktop e mobile nos estados de sucesso, vazio, loading e erro.
+- O Golden Dataset passa nos idiomas `pt-BR` e `en-US`, com execução comparável registrada no Langfuse.
+- Deploy, backup e restauração foram exercitados no droplet alvo.
