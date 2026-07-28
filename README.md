@@ -125,6 +125,7 @@ make check
 
 - [CONTEXT.md](CONTEXT.md): linguagem canônica do domínio.
 - [docs/SPEC.md](docs/SPEC.md): especificação vigente do V1.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): arquitetura implementada e seus limites atuais.
 - [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md): plano de execução em fatias verticais.
 - [docs/adr/](docs/adr/): decisões arquiteturais e seus trade-offs.
 
