@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal, Self, cast
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.middleware.sessions import SessionMiddleware
@@ -28,6 +28,12 @@ from ask_about_me.composition import build_portfolio_rag
 from ask_about_me.config import Settings, get_settings
 from ask_about_me.db import Database
 from ask_about_me.knowledge_base import StaleIndexGenerationError
+from ask_about_me.portfolio_content import (
+    PortfolioContentNotFoundError,
+    PortfolioContentReader,
+    PostgresPortfolioContentCatalog,
+    select_locale,
+)
 from ask_about_me.providers import OpenAIProviderUnavailableError
 from ask_about_me.rag import (
     AnswerStatus,
@@ -228,6 +234,14 @@ class PublicCaseStudyResponse(HttpModel):
     sections: list[PublicCaseStudySectionResponse]
 
 
+class PortfolioContentResponse(HttpModel):
+    revision: int
+    locale: Locale
+    profile: dict[str, object]
+    experiences: list[dict[str, object]]
+    projects: list[dict[str, object]]
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -236,6 +250,7 @@ def create_app(
     admin_case_studies: AdminCaseStudyService | None = None,
     admin_case_study_service_factory: AdminCaseStudyServiceFactory | None = None,
     case_study_reader: CaseStudyReader | None = None,
+    portfolio_content_reader: PortfolioContentReader | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
     admin_enabled = _has_admin_credentials(resolved_settings)
@@ -247,6 +262,10 @@ def create_app(
         app.state.admin_case_studies = admin_case_studies
         app.state.case_study_reader = case_study_reader or PostgresCaseStudyCatalog(
             database=cast(Database, app.state.database)
+        )
+        app.state.portfolio_content_reader = (
+            portfolio_content_reader
+            or PostgresPortfolioContentCatalog(database=cast(Database, app.state.database))
         )
         if app.state.portfolio_rag is None and _has_openai_api_key(resolved_settings):
             factory = rag_factory or build_portfolio_rag
@@ -307,6 +326,32 @@ def create_app(
         except CaseStudyNotFoundError as error:
             raise HTTPException(status_code=404, detail="case study not found") from error
         return _to_public_case_study_response(case_study, locale)
+
+    @app.get("/portfolio", response_model=PortfolioContentResponse)
+    async def get_portfolio_content(
+        request: Request,
+        response: Response,
+        locale: Locale = Locale.PT_BR,
+        version: Annotated[int | None, Query(ge=1)] = None,
+    ) -> PortfolioContentResponse:
+        reader = cast(PortfolioContentReader, request.app.state.portfolio_content_reader)
+        try:
+            snapshot = (
+                await reader.get_current()
+                if version is None
+                else await reader.get_revision(version)
+            )
+        except PortfolioContentNotFoundError as error:
+            raise HTTPException(status_code=404, detail="portfolio content not found") from error
+        content = select_locale(snapshot, locale)
+        response.headers["ETag"] = f'"portfolio-{snapshot.revision}-{locale.value}"'
+        return PortfolioContentResponse(
+            revision=snapshot.revision,
+            locale=locale,
+            profile=content.profile,
+            experiences=list(content.experiences),
+            projects=list(content.projects),
+        )
 
     @app.post("/admin/session", status_code=204)
     async def create_admin_session(payload: AdminLoginRequest, request: Request) -> Response:

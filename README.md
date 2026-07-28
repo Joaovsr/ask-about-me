@@ -43,6 +43,8 @@ O Postgres de desenvolvimento fica restrito a `127.0.0.1:5432`, com pgvector hab
 - `GET /health/ready`: processo e Postgres disponíveis.
 - `GET /case-studies/{slug}?locale=pt-BR|en-US`: conteúdo público localizado do
   Case Study atual, incluindo sua revisão.
+- `GET /portfolio?locale=pt-BR|en-US`: snapshot público localizado de perfil,
+  experiências e projetos para o portfólio Vue.
 - `POST /ask`: pipeline retrieve-then-generate completa. Com
   `AAM_OPENAI_API_KEY` configurada, a aplicação compõe automaticamente retrieval,
   embeddings e geração; sem a chave, responde `503` de forma explícita.
@@ -61,9 +63,10 @@ combina pgvector e full-text search em português por Reciprocal Rank Fusion. Ge
 embeddings ficam atrás de interfaces estreitas para permitir o spike de provedor sem
 alterar os módulos de Knowledge Base e RAG de Portfólio.
 
-O primeiro seed versionado é um Case Study da plataforma de gestão de pessoas com IA. A
+O seed versionado inclui um Case Study da plataforma de gestão de pessoas com IA e o
+snapshot inicial de perfil, experiências e projetos do portfólio. A
 revisão mantém campos explícitos em `pt-BR` e `en-US`; sua projeção determinística usa
-apenas título e seções em `pt-BR` como texto canônico do KB. A publicação prepara os
+o `pt-BR` como texto canônico do KB. A publicação prepara os
 embeddings antes e confirma revisão, ponteiro público e geração do índice na mesma
 transação, evitando conteúdo publicado sem evidência pesquisável. A nova geração substitui
 somente as origens alteradas e preserva os demais KB Docs ativos, independentemente do
