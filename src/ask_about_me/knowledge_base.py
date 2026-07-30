@@ -9,7 +9,17 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from ask_about_me.db import Database
-from ask_about_me.rag import ConversationMessage, DocumentType, RetrievedChunk
+from ask_about_me.rag import (
+    ConversationMessage,
+    DeterministicRetrievalQueryBuilder,
+    DocumentType,
+    RetrievalQuery,
+    RetrievalSignals,
+    RetrievedChunk,
+)
+
+WEIGHTED_LEXICAL_STRATEGY = "weighted-portuguese-v1"
+RETRIEVAL_PROFILE = "hybrid-v2:weighted-lexical-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +34,16 @@ class IndexProfile:
     embedding: EmbeddingProfile
     chunker_version: str
     canonical_locale: str = "pt-BR"
+    lexical_strategy_version: str = WEIGHTED_LEXICAL_STRATEGY
+
+    @property
+    def identifier(self) -> str:
+        embedding = self.embedding
+        return (
+            f"embedding={embedding.provider}/{embedding.model}/{embedding.dimensions};"
+            f"chunker={self.chunker_version};locale={self.canonical_locale};"
+            f"lexical={self.lexical_strategy_version}"
+        )
 
 
 class EmbeddingProvider(Protocol):
@@ -247,9 +267,7 @@ class TokenSectionChunker:
             paragraph = paragraph_parts[index]
             if not paragraph:
                 continue
-            separator = (
-                paragraph_parts[index + 1] if index + 1 < len(paragraph_parts) else ""
-            )
+            separator = paragraph_parts[index + 1] if index + 1 < len(paragraph_parts) else ""
             paragraphs.append(paragraph + separator)
 
         for paragraph in paragraphs:
@@ -306,6 +324,7 @@ class PostgresKnowledgeBase:
         embedding_provider: EmbeddingProvider,
         chunker: DocumentChunker | None = None,
         result_limit: int = 8,
+        retrieval_query_builder: DeterministicRetrievalQueryBuilder | None = None,
     ) -> None:
         if result_limit < 1:
             raise ValueError("result_limit must be positive")
@@ -313,6 +332,9 @@ class PostgresKnowledgeBase:
         self._embedding_provider = embedding_provider
         self._chunker = chunker or TokenSectionChunker()
         self._result_limit = result_limit
+        self._retrieval_query_builder = (
+            retrieval_query_builder or DeterministicRetrievalQueryBuilder()
+        )
 
     async def get_active_generation_id(self) -> UUID | None:
         async with self._database.connect() as connection:
@@ -335,6 +357,17 @@ class PostgresKnowledgeBase:
         async with self._database.connect() as connection:
             return await self._read_index_profile(connection)
 
+    async def get_index_profile(
+        self,
+        *,
+        generation_id: UUID | None = None,
+    ) -> IndexProfile | None:
+        async with self._database.connect() as connection:
+            return await self._read_index_profile(
+                connection,
+                generation_id=generation_id,
+            )
+
     @staticmethod
     async def _read_index_profile(
         connection: AsyncConnection,
@@ -349,7 +382,8 @@ class PostgresKnowledgeBase:
                     embedding_model,
                     embedding_dimensions,
                     chunker_version,
-                    canonical_locale
+                    canonical_locale,
+                    lexical_strategy_version
                 FROM kb_index_generations
                 WHERE (
                     CAST(:generation_id AS uuid) IS NULL
@@ -370,6 +404,7 @@ class PostgresKnowledgeBase:
             ),
             chunker_version=row.chunker_version,
             canonical_locale=row.canonical_locale,
+            lexical_strategy_version=row.lexical_strategy_version,
         )
 
     async def replace_index(
@@ -644,7 +679,8 @@ class PostgresKnowledgeBase:
             text(
                 """
                 INSERT INTO kb_chunks (
-                    id, document_id, position, section, content, embedding
+                    id, document_id, position, section, content, embedding,
+                    lexical_search_vector
                 )
                 SELECT
                     md5(chunk.id::text || CAST(:target_generation AS text))::uuid,
@@ -652,7 +688,8 @@ class PostgresKnowledgeBase:
                     chunk.position,
                     chunk.section,
                     chunk.content,
-                    chunk.embedding
+                    chunk.embedding,
+                    chunk.lexical_search_vector
                 FROM kb_chunks AS chunk
                 JOIN kb_documents AS document ON document.id = chunk.document_id
                 JOIN kb_index_generations AS generation
@@ -736,9 +773,8 @@ class PostgresKnowledgeBase:
                 configured=self._embedding_provider.profile,
             )
 
-        retrieval_query = self._build_retrieval_query(question, history)
-        full_text_query = self._build_full_text_query(question, history)
-        embedding = await self._embedding_provider.embed_query(retrieval_query)
+        retrieval_query = self.build_retrieval_query(question, history)
+        embedding = await self._embedding_provider.embed_query(retrieval_query.embedding_text)
         self._validate_embeddings(
             (embedding,),
             expected_count=1,
@@ -754,6 +790,7 @@ class PostgresKnowledgeBase:
                     WITH vector_ranked AS (
                         SELECT
                             chunk.id,
+                            chunk.embedding <=> CAST(:embedding AS vector) AS distance,
                             ROW_NUMBER() OVER (
                                 ORDER BY chunk.embedding <=> CAST(:embedding AS vector), chunk.id
                             ) AS rank
@@ -774,10 +811,14 @@ class PostgresKnowledgeBase:
                     text_ranked AS (
                         SELECT
                             chunk.id,
+                            ts_rank_cd(
+                                chunk.lexical_search_vector,
+                                websearch_to_tsquery('portuguese', :question)
+                            ) AS rank_cd,
                             ROW_NUMBER() OVER (
                                 ORDER BY
                                     ts_rank_cd(
-                                        chunk.search_vector,
+                                        chunk.lexical_search_vector,
                                         websearch_to_tsquery('portuguese', :question)
                                     ) DESC,
                                     chunk.id
@@ -793,10 +834,11 @@ class PostgresKnowledgeBase:
                                 )
                                 OR generation.id = CAST(:generation_id AS uuid)
                             )
-                        WHERE chunk.search_vector @@ websearch_to_tsquery('portuguese', :question)
+                        WHERE chunk.lexical_search_vector
+                            @@ websearch_to_tsquery('portuguese', :question)
                         ORDER BY
                             ts_rank_cd(
-                                chunk.search_vector,
+                                chunk.lexical_search_vector,
                                 websearch_to_tsquery('portuguese', :question)
                             ) DESC,
                             chunk.id
@@ -811,7 +853,12 @@ class PostgresKnowledgeBase:
                         SELECT
                             candidate.id,
                             COALESCE(1.0 / (60 + vector_ranked.rank), 0.0)
-                                + COALESCE(1.0 / (60 + text_ranked.rank), 0.0) AS score
+                                + COALESCE(1.0 / (60 + text_ranked.rank), 0.0)
+                                AS rrf_score,
+                            vector_ranked.distance AS vector_distance,
+                            vector_ranked.rank AS vector_rank,
+                            text_ranked.rank_cd AS text_rank_cd,
+                            text_ranked.rank AS text_rank
                         FROM candidate_ids AS candidate
                         LEFT JOIN vector_ranked ON vector_ranked.id = candidate.id
                         LEFT JOIN text_ranked ON text_ranked.id = candidate.id
@@ -823,20 +870,32 @@ class PostgresKnowledgeBase:
                         document.source_revision,
                         document.doc_type AS document_type,
                         document.title,
+                        document.slug AS source_slug,
                         chunk.section,
                         chunk.content AS excerpt,
                         document.source_url,
-                        ranked.score
+                        ranked.rrf_score,
+                        ranked.vector_distance,
+                        ranked.vector_rank,
+                        ranked.text_rank_cd,
+                        ranked.text_rank,
+                        to_tsvector('portuguese', document.title)
+                            @@ websearch_to_tsquery('portuguese', :question)
+                            AS title_match,
+                        to_tsvector('portuguese', chunk.section)
+                            @@ websearch_to_tsquery('portuguese', :question)
+                            AS section_match,
+                        document.index_generation
                     FROM ranked
                     JOIN kb_chunks AS chunk ON chunk.id = ranked.id
                     JOIN kb_documents AS document ON document.id = chunk.document_id
-                    ORDER BY ranked.score DESC, chunk.id
+                    ORDER BY ranked.rrf_score DESC, chunk.id
                     LIMIT :result_limit
                     """
                 ),
                 {
                     "embedding": embedding_literal,
-                    "question": full_text_query,
+                    "question": retrieval_query.lexical_text,
                     "generation_id": generation_id,
                     "candidate_limit": candidate_limit,
                     "result_limit": self._result_limit,
@@ -849,29 +908,39 @@ class PostgresKnowledgeBase:
                 document_id=row.document_id,
                 source_id=row.source_id,
                 source_revision=row.source_revision,
+                source_slug=row.source_slug,
                 document_type=DocumentType(row.document_type),
                 title=row.title,
                 section=row.section,
                 excerpt=row.excerpt,
                 source_url=row.source_url,
-                score=float(row.score),
+                signals=RetrievalSignals(
+                    vector_distance=(
+                        None if row.vector_distance is None else float(row.vector_distance)
+                    ),
+                    vector_similarity=(
+                        None if row.vector_distance is None else 1.0 - float(row.vector_distance)
+                    ),
+                    vector_rank=(None if row.vector_rank is None else int(row.vector_rank)),
+                    text_rank_cd=(None if row.text_rank_cd is None else float(row.text_rank_cd)),
+                    text_rank=None if row.text_rank is None else int(row.text_rank),
+                    title_match=bool(row.title_match),
+                    section_match=bool(row.section_match),
+                    rrf_score=float(row.rrf_score),
+                    retrieval_profile=RETRIEVAL_PROFILE,
+                    index_generation=row.index_generation,
+                    index_profile=index_profile.identifier,
+                ),
             )
             for row in result
         )
 
-    @staticmethod
-    def _build_retrieval_query(question: str, history: tuple[ConversationMessage, ...]) -> str:
-        return "\n".join(PostgresKnowledgeBase._retrieval_terms(question, history))
-
-    @staticmethod
-    def _build_full_text_query(question: str, history: tuple[ConversationMessage, ...]) -> str:
-        return " OR ".join(PostgresKnowledgeBase._retrieval_terms(question, history))
-
-    @staticmethod
-    def _retrieval_terms(
-        question: str, history: tuple[ConversationMessage, ...]
-    ) -> tuple[str, ...]:
-        return (*(message.content for message in history[-4:]), question)
+    def build_retrieval_query(
+        self,
+        question: str,
+        history: tuple[ConversationMessage, ...],
+    ) -> RetrievalQuery:
+        return self._retrieval_query_builder.build(question, history)
 
     @staticmethod
     def _to_vector_literal(embedding: tuple[float, ...]) -> str:
@@ -964,7 +1033,8 @@ class PostgresKnowledgeBase:
                     embedding_model,
                     embedding_dimensions,
                     chunker_version,
-                    canonical_locale
+                    canonical_locale,
+                    lexical_strategy_version
                 )
                 VALUES (
                     :generation_id,
@@ -973,7 +1043,8 @@ class PostgresKnowledgeBase:
                     :embedding_model,
                     :embedding_dimensions,
                     :chunker_version,
-                    'pt-BR'
+                    'pt-BR',
+                    :lexical_strategy_version
                 )
                 """
             ),
@@ -983,6 +1054,7 @@ class PostgresKnowledgeBase:
                 "embedding_model": index_profile.embedding.model,
                 "embedding_dimensions": index_profile.embedding.dimensions,
                 "chunker_version": index_profile.chunker_version,
+                "lexical_strategy_version": index_profile.lexical_strategy_version,
             },
         )
         await connection.execute(
@@ -1024,6 +1096,7 @@ class PostgresKnowledgeBase:
                         "position": chunk.position,
                         "section": chunk.section,
                         "content": chunk.content,
+                        "title": prepared.document.title.strip(),
                         "embedding": self._to_vector_literal(embeddings[embedding_index]),
                     }
                 )
@@ -1033,10 +1106,14 @@ class PostgresKnowledgeBase:
             text(
                 """
                 INSERT INTO kb_chunks (
-                    id, document_id, position, section, content, embedding
+                    id, document_id, position, section, content, embedding,
+                    lexical_search_vector
                 ) VALUES (
                     :id, :document_id, :position, :section, :content,
-                    CAST(:embedding AS vector)
+                    CAST(:embedding AS vector),
+                    setweight(to_tsvector('portuguese', :title), 'A')
+                        || setweight(to_tsvector('portuguese', :section), 'B')
+                        || setweight(to_tsvector('portuguese', :content), 'D')
                 )
                 """
             ),

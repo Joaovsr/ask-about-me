@@ -65,8 +65,7 @@ def test_token_section_chunker_preserves_internal_paragraph_whitespace() -> None
         overlap_tokens=10,
     )
     source_text = (
-        "O processo manual demorava várias horas.\n\n"
-        "A busca semântica reduziu esse tempo."
+        "O processo manual demorava várias horas.\n\nA busca semântica reduziu esse tempo."
     )
     document = ProjectedKbDocument(
         source_id=UUID("ee40266e-dd1e-486e-a941-ed3a7b66386c"),
@@ -141,9 +140,7 @@ class RecordingEmbeddingProvider:
 
 
 def test_prepare_index_embeds_document_context_with_each_raw_chunk() -> None:
-    database = Database(
-        "postgresql+psycopg://ask_about_me:ask_about_me@127.0.0.1:1/not-used"
-    )
+    database = Database("postgresql+psycopg://ask_about_me:ask_about_me@127.0.0.1:1/not-used")
     provider = RecordingEmbeddingProvider()
     knowledge_base = PostgresKnowledgeBase(
         database=database,
@@ -182,6 +179,60 @@ def test_prepare_index_embeds_document_context_with_each_raw_chunk() -> None:
     )
 
 
+def test_retrieval_query_uses_only_the_last_user_turn_for_an_elliptical_follow_up() -> None:
+    database = Database("postgresql+psycopg://ask_about_me:ask_about_me@127.0.0.1:1/not-used")
+    knowledge_base = PostgresKnowledgeBase(
+        database=database,
+        embedding_provider=FixedEmbeddingProvider(),
+    )
+
+    query = knowledge_base.build_retrieval_query(
+        "E qual foi o resultado?",
+        (
+            ConversationMessage(
+                role=ConversationRole.USER,
+                content="Fale sobre o Fictor360 AI.",
+            ),
+            ConversationMessage(
+                role=ConversationRole.ASSISTANT,
+                content="A resposta anterior mencionou Power BI.",
+            ),
+        ),
+    )
+
+    assert query.history_used == (
+        ConversationMessage(
+            role=ConversationRole.USER,
+            content="Fale sobre o Fictor360 AI.",
+        ),
+    )
+    assert query.embedding_text == "Fale sobre o Fictor360 AI.\nE qual foi o resultado?"
+    assert query.lexical_text == "o Fictor360 AI. OR E qual foi o resultado?"
+    assert query.history_reason == "elliptical_turn"
+
+
+def test_retrieval_query_does_not_inherit_history_for_a_complete_topic_switch() -> None:
+    database = Database("postgresql+psycopg://ask_about_me:ask_about_me@127.0.0.1:1/not-used")
+    knowledge_base = PostgresKnowledgeBase(
+        database=database,
+        embedding_provider=FixedEmbeddingProvider(),
+    )
+
+    query = knowledge_base.build_retrieval_query(
+        "Qual o presidente do Brasil?",
+        (
+            ConversationMessage(
+                role=ConversationRole.USER,
+                content="Como funciona o Portal do Candidato?",
+            ),
+        ),
+    )
+
+    assert query.history_used == ()
+    assert query.embedding_text == "Qual o presidente do Brasil?"
+    assert "Portal" not in query.lexical_text
+
+
 def test_search_my_work_combines_vector_and_portuguese_full_text_search(
     test_database_url: str,
 ) -> None:
@@ -202,7 +253,8 @@ def test_search_my_work_combines_vector_and_portuguese_full_text_search(
                         embedding_model,
                         embedding_dimensions,
                         chunker_version,
-                        canonical_locale
+                        canonical_locale,
+                        lexical_strategy_version
                     )
                     VALUES (
                         'd737467e-7c27-46f8-9347-3c6265530475',
@@ -211,7 +263,8 @@ def test_search_my_work_combines_vector_and_portuguese_full_text_search(
                         'fixed',
                         3,
                         'manual-test',
-                        'pt-BR'
+                        'pt-BR',
+                        'weighted-portuguese-v1'
                     )
                     """
                 )
@@ -252,7 +305,8 @@ def test_search_my_work_combines_vector_and_portuguese_full_text_search(
                 text(
                     """
                     INSERT INTO kb_chunks (
-                        id, document_id, position, section, content, embedding
+                        id, document_id, position, section, content, embedding,
+                        lexical_search_vector
                     ) VALUES
                         (
                             :expected_chunk_id,
@@ -260,7 +314,20 @@ def test_search_my_work_combines_vector_and_portuguese_full_text_search(
                             0,
                             'Implementação',
                             'A plataforma automatizou o recrutamento com busca semântica.',
-                            '[0.9,0.1,0]'::vector
+                            '[0.9,0.1,0]'::vector,
+                            setweight(
+                                to_tsvector('portuguese', 'Plataforma de recrutamento'),
+                                'A'
+                            )
+                                || setweight(to_tsvector('portuguese', 'Implementação'), 'B')
+                                || setweight(
+                                    to_tsvector(
+                                        'portuguese',
+                                        'A plataforma automatizou o recrutamento '
+                                        'com busca semântica.'
+                                    ),
+                                    'D'
+                                )
                         ),
                         (
                             :vector_only_chunk_id,
@@ -268,7 +335,16 @@ def test_search_my_work_combines_vector_and_portuguese_full_text_search(
                             0,
                             'Resumo',
                             'Experiência geral com desenvolvimento de software.',
-                            '[1,0,0]'::vector
+                            '[1,0,0]'::vector,
+                            setweight(to_tsvector('portuguese', 'Perfil técnico'), 'A')
+                                || setweight(to_tsvector('portuguese', 'Resumo'), 'B')
+                                || setweight(
+                                    to_tsvector(
+                                        'portuguese',
+                                        'Experiência geral com desenvolvimento de software.'
+                                    ),
+                                    'D'
+                                )
                         )
                     """
                 ),
@@ -305,7 +381,14 @@ def test_search_my_work_combines_vector_and_portuguese_full_text_search(
     assert results[0].title == "Plataforma de recrutamento"
     assert results[0].document_type == "case_study"
     assert results[0].excerpt == ("A plataforma automatizou o recrutamento com busca semântica.")
-    assert results[0].score > results[1].score
+    assert results[0].signals.vector_distance is not None
+    assert results[0].signals.vector_similarity is not None
+    assert results[0].signals.vector_rank == 2
+    assert results[0].signals.text_rank_cd is not None
+    assert results[0].signals.text_rank == 1
+    assert results[0].signals.rrf_score > results[1].signals.rrf_score
+    assert results[1].signals.text_rank_cd is None
+    assert results[1].signals.text_rank is None
 
 
 def test_replace_index_switches_the_searchable_generation_atomically(

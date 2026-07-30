@@ -31,6 +31,7 @@ class AnswerStatus(StrEnum):
 
 class LimitationReason(StrEnum):
     INCOMPLETE_EVIDENCE = "incomplete_evidence"
+    OUT_OF_SCOPE = "out_of_scope"
 
 
 class AnswerValidationIssue(StrEnum):
@@ -54,6 +55,31 @@ class ConversationMessage:
 
 
 @dataclass(frozen=True)
+class RetrievalQuery:
+    original_question: str
+    embedding_text: str
+    lexical_text: str
+    history_used: tuple[ConversationMessage, ...]
+    history_reason: str | None
+    strategy_version: str = "deterministic-query-v1"
+
+
+@dataclass(frozen=True)
+class RetrievalSignals:
+    vector_distance: float | None
+    vector_similarity: float | None
+    vector_rank: int | None
+    text_rank_cd: float | None
+    text_rank: int | None
+    title_match: bool
+    section_match: bool
+    rrf_score: float
+    retrieval_profile: str = "hybrid-v2:weighted-lexical-v1"
+    index_generation: UUID | None = None
+    index_profile: str = ""
+
+
+@dataclass(frozen=True)
 class RetrievedChunk:
     id: UUID
     document_id: UUID
@@ -64,7 +90,27 @@ class RetrievedChunk:
     section: str
     excerpt: str
     source_url: str
-    score: float
+    signals: RetrievalSignals
+    source_slug: str = ""
+
+
+@dataclass(frozen=True)
+class SupportFeatures:
+    best_vector_similarity: float | None
+    best_text_rank_cd: float | None
+    has_title_match: bool
+    has_section_match: bool
+    channels_agree: bool
+    supporting_document_count: int
+
+
+@dataclass(frozen=True)
+class SupportDecision:
+    supported: bool
+    rule_version: str
+    features: SupportFeatures
+    reasons: tuple[str, ...]
+    approved_chunks: tuple[RetrievedChunk, ...]
 
 
 @dataclass(frozen=True)
@@ -145,6 +191,17 @@ class ClaimAtomicityValidator(Protocol):
     def is_atomic(self, text: str) -> bool: ...
 
 
+class EvidenceSupportEvaluator(Protocol):
+    def evaluate(
+        self,
+        *,
+        question: str,
+        retrieval_query: RetrievalQuery,
+        chunks: tuple[RetrievedChunk, ...],
+        retrieval_profile: str,
+    ) -> SupportDecision: ...
+
+
 class ConservativeClaimAtomicityValidator:
     _clause_boundary = re.compile(
         r"[,;:]|\s[—–-]\s|\b(?:e|and|mas|but|al[eé]m disso|additionally)\b",
@@ -157,6 +214,182 @@ class ConservativeClaimAtomicityValidator:
             return False
         sentence_endings = re.findall(r"[.!?](?=\s+\S|$)", stripped)
         return len(sentence_endings) <= 1 and self._clause_boundary.search(stripped) is None
+
+
+class DeterministicRetrievalQueryBuilder:
+    """Build a standalone retrieval query without allowing history to mask topic changes."""
+
+    _elliptical = re.compile(
+        r"^(?:e|and)\b|"
+        r"\b(?:nesse|nessa|neste|nesta|dele|dela|disso|desse|dessa|"
+        r"that|this|it|its|there)\b|"
+        r"^(?:qual|quais|what|which)\s+(?:foi|foram|era|were|was|is|are)\b",
+        re.IGNORECASE,
+    )
+    _navigation = re.compile(
+        r"\b(?:jo[aã]o|ele|ela|he|she|you|voc[eê])\b|"
+        r"\b(?:trabalhou|trabalha|worked|works)\s+com\b|"
+        r"\b(?:fale|conte|tell\s+me|talk)\s+(?:sobre|about)\b",
+        re.IGNORECASE,
+    )
+
+    def build(
+        self,
+        question: str,
+        history: tuple[ConversationMessage, ...],
+    ) -> RetrievalQuery:
+        stripped_question = question.strip()
+        history_used: tuple[ConversationMessage, ...] = ()
+        history_reason: str | None = None
+        if self._elliptical.search(stripped_question):
+            last_user_message = next(
+                (message for message in reversed(history) if message.role is ConversationRole.USER),
+                None,
+            )
+            if last_user_message is not None:
+                history_used = (last_user_message,)
+                history_reason = "elliptical_turn"
+
+        embedding_parts = (*(message.content for message in history_used), stripped_question)
+        lexical_parts = (
+            *(self._lexical_terms(message.content) for message in history_used),
+            self._lexical_terms(stripped_question),
+        )
+        lexical_text = " OR ".join(part for part in lexical_parts if part).strip()
+        return RetrievalQuery(
+            original_question=stripped_question,
+            embedding_text="\n".join(embedding_parts),
+            lexical_text=lexical_text or stripped_question,
+            history_used=history_used,
+            history_reason=history_reason,
+        )
+
+    def _lexical_terms(self, value: str) -> str:
+        return " ".join(self._navigation.sub(" ", value).split())
+
+
+class CalibratedEvidenceSupportEvaluator:
+    """Decide whether retrieved evidence supports generation using raw retrieval signals."""
+
+    def __init__(
+        self,
+        *,
+        minimum_vector_similarity: float = 0.45,
+        minimum_text_rank_cd: float = 0.05,
+        rule_version: str = "support-v1",
+        retrieval_profile: str = "hybrid-v2:weighted-lexical-v1",
+        generation_limit: int = 6,
+        per_document_limit: int = 2,
+    ) -> None:
+        self._minimum_vector_similarity = minimum_vector_similarity
+        self._minimum_text_rank_cd = minimum_text_rank_cd
+        self._rule_version = rule_version
+        self._retrieval_profile = retrieval_profile
+        self._generation_limit = generation_limit
+        self._per_document_limit = per_document_limit
+
+    def evaluate(
+        self,
+        *,
+        question: str,
+        retrieval_query: RetrievalQuery,
+        chunks: tuple[RetrievedChunk, ...],
+        retrieval_profile: str,
+    ) -> SupportDecision:
+        del question, retrieval_query
+        observed_profiles = {
+            retrieval_profile,
+            *(chunk.signals.retrieval_profile for chunk in chunks),
+        }
+        incompatible = observed_profiles - {self._retrieval_profile}
+        if incompatible or len(observed_profiles) != 1:
+            profiles = ", ".join(sorted(observed_profiles))
+            raise RuntimeError(
+                f"support thresholds are incompatible with retrieval profile(s): {profiles}"
+            )
+
+        approved = tuple(chunk for chunk in chunks if self._supports_generation(chunk))
+        selected = self._select_context(approved)
+        similarities = [
+            chunk.signals.vector_similarity
+            for chunk in chunks
+            if chunk.signals.vector_similarity is not None
+        ]
+        text_ranks = [
+            chunk.signals.text_rank_cd for chunk in chunks if chunk.signals.text_rank_cd is not None
+        ]
+        has_title_match = any(chunk.signals.title_match for chunk in chunks)
+        has_section_match = any(chunk.signals.section_match for chunk in chunks)
+        channels_agree = any(
+            chunk.signals.vector_rank is not None and chunk.signals.text_rank is not None
+            for chunk in chunks
+        )
+        reasons: list[str] = []
+        if has_title_match:
+            reasons.append("published_title_match")
+        if text_ranks and max(text_ranks) >= self._minimum_text_rank_cd:
+            reasons.append("strong_lexical_match")
+        if similarities and max(similarities) >= self._minimum_vector_similarity:
+            reasons.append("strong_semantic_match")
+        if not selected:
+            reasons.append("no_chunk_passed_support_thresholds")
+
+        return SupportDecision(
+            supported=bool(selected),
+            rule_version=self._rule_version,
+            features=SupportFeatures(
+                best_vector_similarity=max(similarities, default=None),
+                best_text_rank_cd=max(text_ranks, default=None),
+                has_title_match=has_title_match,
+                has_section_match=has_section_match,
+                channels_agree=channels_agree,
+                supporting_document_count=len({chunk.document_id for chunk in approved}),
+            ),
+            reasons=tuple(reasons),
+            approved_chunks=selected,
+        )
+
+    def _supports_generation(self, chunk: RetrievedChunk) -> bool:
+        signals = chunk.signals
+        return bool(
+            signals.title_match
+            or (
+                signals.text_rank_cd is not None
+                and signals.text_rank_cd >= self._minimum_text_rank_cd
+            )
+            or (
+                signals.vector_similarity is not None
+                and signals.vector_similarity >= self._minimum_vector_similarity
+            )
+        )
+
+    def _select_context(self, chunks: tuple[RetrievedChunk, ...]) -> tuple[RetrievedChunk, ...]:
+        selected: list[RetrievedChunk] = []
+        per_document: dict[UUID, int] = {}
+        seen_sections: set[tuple[UUID, str]] = set()
+        deferred: list[RetrievedChunk] = []
+        for chunk in chunks:
+            document_count = per_document.get(chunk.document_id, 0)
+            if document_count >= self._per_document_limit:
+                continue
+            section_key = (chunk.document_id, chunk.section.casefold())
+            if section_key in seen_sections:
+                deferred.append(chunk)
+                continue
+            selected.append(chunk)
+            per_document[chunk.document_id] = document_count + 1
+            seen_sections.add(section_key)
+            if len(selected) == self._generation_limit:
+                return tuple(selected)
+        for chunk in deferred:
+            document_count = per_document.get(chunk.document_id, 0)
+            if document_count >= self._per_document_limit:
+                continue
+            selected.append(chunk)
+            per_document[chunk.document_id] = document_count + 1
+            if len(selected) == self._generation_limit:
+                break
+        return tuple(selected)
 
 
 class PortfolioRag:
@@ -190,11 +423,19 @@ class PortfolioRag:
         knowledge_base: KnowledgeBase,
         answer_generator: AnswerGenerator,
         claim_atomicity_validator: ClaimAtomicityValidator | None = None,
+        evidence_support_evaluator: EvidenceSupportEvaluator | None = None,
+        retrieval_query_builder: DeterministicRetrievalQueryBuilder | None = None,
     ) -> None:
         self._knowledge_base = knowledge_base
         self._answer_generator = answer_generator
         self._claim_atomicity_validator = (
             claim_atomicity_validator or ConservativeClaimAtomicityValidator()
+        )
+        self._evidence_support_evaluator = (
+            evidence_support_evaluator or CalibratedEvidenceSupportEvaluator()
+        )
+        self._retrieval_query_builder = (
+            retrieval_query_builder or DeterministicRetrievalQueryBuilder()
         )
 
     async def answer(
@@ -205,9 +446,19 @@ class PortfolioRag:
         history: Sequence[ConversationMessage],
     ) -> PortfolioAnswer:
         normalized_history = tuple(history)
+        retrieval_query = self._retrieval_query_builder.build(question, normalized_history)
         evidence = await self._knowledge_base.search_my_work(question, normalized_history)
         if not evidence:
             return self._insufficient_answer(locale)
+        support = self._evidence_support_evaluator.evaluate(
+            question=question,
+            retrieval_query=retrieval_query,
+            chunks=evidence,
+            retrieval_profile=evidence[0].signals.retrieval_profile,
+        )
+        if not support.supported:
+            return self._insufficient_answer(locale)
+        evidence = support.approved_chunks
 
         generation_request = AnswerGenerationRequest(
             question=question,
@@ -289,15 +540,23 @@ class PortfolioRag:
         if not all(isinstance(reason, LimitationReason) for reason in generated.limitations):
             issues.append(AnswerValidationIssue.INVALID_LIMITATION)
         if not generated.requested_claim_types or not all(
-            isinstance(claim_type, ClaimType)
-            for claim_type in generated.requested_claim_types
+            isinstance(claim_type, ClaimType) for claim_type in generated.requested_claim_types
         ):
             issues.append(AnswerValidationIssue.INVALID_REQUESTED_CLAIM_TYPE)
 
-        if issues:
+        recoverable_claim_issues = {
+            AnswerValidationIssue.NON_ATOMIC_CLAIM,
+            AnswerValidationIssue.UNKNOWN_CITATION,
+            AnswerValidationIssue.INVALID_AUTHORITY,
+        }
+        if issues and (
+            not claims or any(issue not in recoverable_claim_issues for issue in issues)
+        ):
             return None, tuple(dict.fromkeys(issues))
 
         limitation_reasons = list(generated.limitations)
+        if issues and LimitationReason.INCOMPLETE_EVIDENCE not in limitation_reasons:
+            limitation_reasons.append(LimitationReason.INCOMPLETE_EVIDENCE)
         requested_claim_types = set(generated.requested_claim_types)
         if self._clear_practical_experience_question.search(
             question
@@ -309,9 +568,7 @@ class PortfolioRag:
         ):
             limitation_reasons.append(LimitationReason.INCOMPLETE_EVIDENCE)
 
-        limitations = tuple(
-            self._limitation_item(reason, locale) for reason in limitation_reasons
-        )
+        limitations = tuple(self._limitation_item(reason, locale) for reason in limitation_reasons)
         status = AnswerStatus.PARTIAL if limitations else AnswerStatus.ANSWERED
         return (
             PortfolioAnswer(
@@ -354,16 +611,27 @@ class PortfolioRag:
             LimitationReason.INCOMPLETE_EVIDENCE: {
                 Locale.PT_BR: "A evidência publicada responde apenas parte da pergunta.",
                 Locale.EN_US: "The published evidence answers only part of the question.",
-            }
+            },
+            LimitationReason.OUT_OF_SCOPE: {
+                Locale.PT_BR: "Este chat responde apenas sobre a trajetória técnica do João.",
+                Locale.EN_US: "This chat only answers questions about João's technical journey.",
+            },
         }
         return LimitationAnswerItem(text=texts[reason][locale])
 
     @staticmethod
-    def _insufficient_answer(locale: Locale) -> PortfolioAnswer:
-        text = {
-            Locale.PT_BR: "Não há evidência publicada suficiente para responder com segurança.",
-            Locale.EN_US: "There is not enough published evidence to answer safely.",
-        }[locale]
+    def _insufficient_answer(
+        locale: Locale,
+        reason: LimitationReason | None = None,
+    ) -> PortfolioAnswer:
+        text = (
+            PortfolioRag._limitation_item(reason, locale).text
+            if reason is not None
+            else {
+                Locale.PT_BR: "Não há evidência publicada suficiente para responder com segurança.",
+                Locale.EN_US: "There is not enough published evidence to answer safely.",
+            }[locale]
+        )
         return PortfolioAnswer(
             status=AnswerStatus.INSUFFICIENT,
             answer_items=(LimitationAnswerItem(text=text),),

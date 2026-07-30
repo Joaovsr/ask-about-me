@@ -14,6 +14,7 @@ from ask_about_me.rag import (
     GeneratedClaim,
     LimitationReason,
     PortfolioRag,
+    RetrievalSignals,
     RetrievedChunk,
 )
 
@@ -38,7 +39,16 @@ class CaseStudyKnowledgeBase:
                 section="Implementação",
                 excerpt="Trecho factual publicado para um teste determinístico.",
                 source_url="/case-studies/exemplo?locale=pt-BR&version=3",
-                score=1.0,
+                signals=RetrievalSignals(
+                    vector_distance=0.2,
+                    vector_similarity=0.8,
+                    vector_rank=1,
+                    text_rank_cd=None,
+                    text_rank=None,
+                    title_match=False,
+                    section_match=False,
+                    rrf_score=1 / 61,
+                ),
             ),
         )
 
@@ -64,6 +74,39 @@ class EmptyKnowledgeBase:
         return ()
 
 
+class WeakKnowledgeBase:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def search_my_work(
+        self, question: str, history: tuple[object, ...]
+    ) -> tuple[RetrievedChunk, ...]:
+        self.calls += 1
+        return (
+            RetrievedChunk(
+                id=CHUNK_ID,
+                document_id=DOCUMENT_ID,
+                source_id=SOURCE_ID,
+                source_revision=3,
+                document_type=DocumentType.CASE_STUDY,
+                title="Case Study sem relação",
+                section="Implementação",
+                excerpt="Trecho que não sustenta a pergunta.",
+                source_url="/case-studies/exemplo?locale=pt-BR&version=3",
+                signals=RetrievalSignals(
+                    vector_distance=0.75,
+                    vector_similarity=0.25,
+                    vector_rank=1,
+                    text_rank_cd=None,
+                    text_rank=None,
+                    title_match=False,
+                    section_match=False,
+                    rrf_score=1 / 61,
+                ),
+            ),
+        )
+
+
 class EssayKnowledgeBase:
     async def search_my_work(
         self, question: str, history: tuple[object, ...]
@@ -79,7 +122,16 @@ class EssayKnowledgeBase:
                 section="Tese",
                 excerpt="Uma opinião técnica publicada para um teste determinístico.",
                 source_url="/essays/exemplo?locale=pt-BR&version=1",
-                score=1.0,
+                signals=RetrievalSignals(
+                    vector_distance=0.2,
+                    vector_similarity=0.8,
+                    vector_rank=1,
+                    text_rank_cd=None,
+                    text_rank=None,
+                    title_match=False,
+                    section_match=False,
+                    rrf_score=1 / 61,
+                ),
             ),
         )
 
@@ -99,7 +151,16 @@ class ProfileKnowledgeBase:
                 section="Experiência",
                 excerpt="O perfil informa que João desenvolveu sistemas de recrutamento.",
                 source_url="/profile?locale=pt-BR&version=1",
-                score=1.0,
+                signals=RetrievalSignals(
+                    vector_distance=0.2,
+                    vector_similarity=0.8,
+                    vector_rank=1,
+                    text_rank_cd=None,
+                    text_rank=None,
+                    title_match=False,
+                    section_match=False,
+                    rrf_score=1 / 61,
+                ),
             ),
         )
 
@@ -122,6 +183,25 @@ class NonAtomicAnswerGenerator:
     async def generate_answer(self, request: AnswerGenerationRequest) -> GeneratedAnswer:
         return GeneratedAnswer(
             claims=(
+                GeneratedClaim(
+                    claim_type=ClaimType.EXPERIENCE,
+                    text="João implementou a solução e liderou a implantação.",
+                    chunk_ids=(CHUNK_ID,),
+                ),
+            ),
+            requested_claim_types=(ClaimType.EXPERIENCE,),
+        )
+
+
+class MixedAtomicityAnswerGenerator:
+    async def generate_answer(self, request: AnswerGenerationRequest) -> GeneratedAnswer:
+        return GeneratedAnswer(
+            claims=(
+                GeneratedClaim(
+                    claim_type=ClaimType.EXPERIENCE,
+                    text="João implementou a solução descrita no Case Study.",
+                    chunk_ids=(CHUNK_ID,),
+                ),
                 GeneratedClaim(
                     claim_type=ClaimType.EXPERIENCE,
                     text="João implementou a solução e liderou a implantação.",
@@ -310,6 +390,41 @@ def test_ask_declares_insufficient_evidence_in_the_requested_locale() -> None:
     ]
 
 
+def test_ask_rejects_an_unsupported_question_after_retrieval_without_generation() -> None:
+    knowledge_base = WeakKnowledgeBase()
+    rag = PortfolioRag(
+        knowledge_base=knowledge_base,
+        answer_generator=AnswerGeneratorThatMustNotRun(),
+    )
+    settings = Settings(database_url="postgresql+psycopg://unused:unused@localhost/unused")
+
+    with TestClient(create_app(settings, portfolio_rag=rag)) as client:
+        response = client.post(
+            "/ask",
+            json={
+                "question": "Qual o presidente do Brasil?",
+                "locale": "pt-BR",
+                "history": [
+                    {"role": "user", "content": "Como funciona o Fictor360 AI?"},
+                    {"role": "assistant", "content": "É um agente com Power BI."},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert knowledge_base.calls == 1
+    assert response.json() == {
+        "status": "insufficient",
+        "answerItems": [
+            {
+                "kind": "limitation",
+                "text": "Não há evidência publicada suficiente para responder com segurança.",
+            }
+        ],
+        "citations": [],
+    }
+
+
 def test_ask_rejects_a_generated_claim_with_multiple_assertions() -> None:
     rag = PortfolioRag(
         knowledge_base=CaseStudyKnowledgeBase(),
@@ -326,6 +441,35 @@ def test_ask_rejects_a_generated_claim_with_multiple_assertions() -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "insufficient"
     assert response.json()["citations"] == []
+
+
+def test_ask_preserves_grounded_atomic_claims_when_other_claims_are_rejected() -> None:
+    rag = PortfolioRag(
+        knowledge_base=CaseStudyKnowledgeBase(),
+        answer_generator=MixedAtomicityAnswerGenerator(),
+    )
+    settings = Settings(database_url="postgresql+psycopg://unused:unused@localhost/unused")
+
+    with TestClient(create_app(settings, portfolio_rag=rag)) as client:
+        response = client.post(
+            "/ask",
+            json={"question": "O que João fez?", "locale": "pt-BR"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "partial"
+    assert response.json()["answerItems"] == [
+        {
+            "kind": "claim",
+            "claimType": "experience",
+            "text": "João implementou a solução descrita no Case Study.",
+            "citationIds": [str(CHUNK_ID)],
+        },
+        {
+            "kind": "limitation",
+            "text": "A evidência publicada responde apenas parte da pergunta.",
+        },
+    ]
 
 
 def test_ask_returns_a_corrected_answer_after_the_first_output_is_invalid() -> None:
@@ -663,9 +807,7 @@ def test_app_treats_an_empty_openai_key_as_unconfigured() -> None:
         )
 
     assert response.status_code == 503
-    assert response.json() == {
-        "detail": {"status": "unavailable", "dependency": "rag"}
-    }
+    assert response.json() == {"detail": {"status": "unavailable", "dependency": "rag"}}
 
 
 def test_ask_maps_generation_outages_without_exposing_provider_details() -> None:
