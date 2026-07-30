@@ -142,7 +142,7 @@ async def _main() -> None:
     print(
         f"Reindexed {indexed_count} published content source(s) with "
         f"{settings.embedding_model}/{settings.embedding_dimensions}. "
-        "Smoke retrieval passed."
+        "Golden Dataset holdout passed."
     )
 
 

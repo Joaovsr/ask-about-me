@@ -208,6 +208,7 @@ def test_retrieval_query_uses_only_the_last_user_turn_for_an_elliptical_follow_u
     )
     assert query.embedding_text == "Fale sobre o Fictor360 AI.\nE qual foi o resultado?"
     assert query.lexical_text == "o Fictor360 AI. OR E qual foi o resultado?"
+    assert query.title_text == "Fictor360 AI"
     assert query.history_reason == "elliptical_turn"
 
 
@@ -231,6 +232,7 @@ def test_retrieval_query_does_not_inherit_history_for_a_complete_topic_switch() 
     assert query.history_used == ()
     assert query.embedding_text == "Qual o presidente do Brasil?"
     assert "Portal" not in query.lexical_text
+    assert query.title_text == "Brasil"
 
     prefixed_query = knowledge_base.build_retrieval_query(
         "E o presidente do Brasil?",
@@ -242,6 +244,27 @@ def test_retrieval_query_does_not_inherit_history_for_a_complete_topic_switch() 
         ),
     )
     assert prefixed_query.history_used == ()
+
+
+def test_retrieval_query_keeps_named_title_terms_separate_from_broad_text() -> None:
+    database = Database("postgresql+psycopg://ask_about_me:ask_about_me@127.0.0.1:1/not-used")
+    knowledge_base = PostgresKnowledgeBase(
+        database=database,
+        embedding_provider=FixedEmbeddingProvider(),
+    )
+
+    product_query = knowledge_base.build_retrieval_query(
+        "Que impacto o InCubo teve nas operações?",
+        (),
+    )
+    tutorial_query = knowledge_base.build_retrieval_query(
+        "Ensine como criar uma medida DAX no Power BI.",
+        (),
+    )
+
+    assert product_query.title_text == "InCubo"
+    assert tutorial_query.title_text == "DAX Power BI"
+    assert product_query.strategy_version == "deterministic-query-v2"
 
 
 def test_search_my_work_combines_vector_and_portuguese_full_text_search(
@@ -381,6 +404,35 @@ def test_search_my_work_combines_vector_and_portuguese_full_text_search(
                 ),
             )
         )
+        evaluation_knowledge_base = PostgresKnowledgeBase(
+            database=database,
+            embedding_provider=FixedEmbeddingProvider(),
+            result_limit=1,
+        )
+        evaluation_results = asyncio.run(
+            evaluation_knowledge_base.search_for_evaluation(
+                "E qual foi o resultado?",
+                (
+                    ConversationMessage(
+                        role=ConversationRole.USER,
+                        content="Como a plataforma automatizou o recrutamento?",
+                    ),
+                ),
+                generation_id=None,
+                candidate_limit=2,
+            )
+        )
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE kb_index_generations
+                    SET lexical_strategy_version = 'legacy-content-only-v1'
+                    WHERE is_active
+                    """
+                )
+            )
+        legacy_results = asyncio.run(knowledge_base.search_my_work("Perfil técnico", ()))
     finally:
         asyncio.run(database.close())
         engine.dispose()
@@ -400,6 +452,12 @@ def test_search_my_work_combines_vector_and_portuguese_full_text_search(
     assert results[0].signals.rrf_score > results[1].signals.rrf_score
     assert results[1].signals.text_rank_cd is None
     assert results[1].signals.text_rank is None
+    assert len(evaluation_results) == 2
+
+    expected_legacy = next(result for result in legacy_results if result.id == VECTOR_ONLY_CHUNK_ID)
+    assert expected_legacy.signals.text_rank_cd is None
+    assert expected_legacy.signals.text_rank is None
+    assert expected_legacy.signals.title_match is False
 
 
 def test_replace_index_switches_the_searchable_generation_atomically(

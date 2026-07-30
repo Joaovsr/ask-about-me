@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from ask_about_me.db import Database
 from ask_about_me.rag import (
+    RETRIEVAL_PIPELINE_VERSION,
     ConversationMessage,
     DeterministicRetrievalQueryBuilder,
     DocumentType,
@@ -18,8 +19,8 @@ from ask_about_me.rag import (
     RetrievedChunk,
 )
 
+LEGACY_LEXICAL_STRATEGY = "legacy-content-only-v1"
 WEIGHTED_LEXICAL_STRATEGY = "weighted-portuguese-v1"
-RETRIEVAL_PROFILE = "hybrid-v2:weighted-lexical-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,12 @@ class IndexProfile:
             f"embedding={embedding.provider}/{embedding.model}/{embedding.dimensions};"
             f"chunker={self.chunker_version};locale={self.canonical_locale};"
             f"lexical={self.lexical_strategy_version}"
+        )
+
+    def retrieval_identifier(self, *, query_strategy_version: str) -> str:
+        return (
+            f"retrieval={RETRIEVAL_PIPELINE_VERSION};"
+            f"query={query_strategy_version};{self.identifier}"
         )
 
 
@@ -118,6 +125,12 @@ class IndexProfileMismatchError(RuntimeError):
         super().__init__(
             "active KB generation uses a different index profile; full reindexing is required"
         )
+
+
+class UnsupportedLexicalStrategyError(RuntimeError):
+    def __init__(self, strategy: str) -> None:
+        self.strategy = strategy
+        super().__init__(f"unsupported lexical strategy {strategy!r}; reindexing is required")
 
 
 class DocumentChunker(Protocol):
@@ -735,6 +748,8 @@ class PostgresKnowledgeBase:
             question,
             history,
             generation_id=None,
+            result_limit=self._result_limit,
+            candidate_limit=self._result_limit * 4,
         )
 
     async def search_generation(
@@ -748,6 +763,26 @@ class PostgresKnowledgeBase:
             question,
             history,
             generation_id=generation_id,
+            result_limit=self._result_limit,
+            candidate_limit=self._result_limit * 4,
+        )
+
+    async def search_for_evaluation(
+        self,
+        question: str,
+        history: tuple[ConversationMessage, ...],
+        *,
+        generation_id: UUID | None,
+        candidate_limit: int,
+    ) -> tuple[RetrievedChunk, ...]:
+        if candidate_limit < 1:
+            raise ValueError("candidate_limit must be positive")
+        return await self._search(
+            question,
+            history,
+            generation_id=generation_id,
+            result_limit=candidate_limit * 2,
+            candidate_limit=candidate_limit,
         )
 
     async def _search(
@@ -756,6 +791,8 @@ class PostgresKnowledgeBase:
         history: tuple[ConversationMessage, ...],
         *,
         generation_id: UUID | None,
+        result_limit: int,
+        candidate_limit: int,
     ) -> tuple[RetrievedChunk, ...]:
         if generation_id is None:
             index_profile = await self.get_active_index_profile()
@@ -772,6 +809,24 @@ class PostgresKnowledgeBase:
                 indexed=index_profile.embedding,
                 configured=self._embedding_provider.profile,
             )
+        lexical_strategy = index_profile.lexical_strategy_version
+        if lexical_strategy == WEIGHTED_LEXICAL_STRATEGY:
+            lexical_vector = "chunk.lexical_search_vector"
+            title_match = (
+                ":title_question <> '' AND "
+                "to_tsvector('portuguese', document.title) "
+                "@@ websearch_to_tsquery('portuguese', :title_question)"
+            )
+            section_match = (
+                "to_tsvector('portuguese', chunk.section) "
+                "@@ websearch_to_tsquery('portuguese', :question)"
+            )
+        elif lexical_strategy == LEGACY_LEXICAL_STRATEGY:
+            lexical_vector = "chunk.search_vector"
+            title_match = "FALSE"
+            section_match = "FALSE"
+        else:
+            raise UnsupportedLexicalStrategyError(lexical_strategy)
 
         retrieval_query = self.build_retrieval_query(question, history)
         embedding = await self._embedding_provider.embed_query(retrieval_query.embedding_text)
@@ -781,12 +836,11 @@ class PostgresKnowledgeBase:
             expected_dimensions=self._embedding_provider.profile.dimensions,
         )
         embedding_literal = self._to_vector_literal(embedding)
-        candidate_limit = self._result_limit * 4
 
         async with self._database.connect() as connection:
             result = await connection.execute(
                 text(
-                    """
+                    f"""
                     WITH vector_ranked AS (
                         SELECT
                             chunk.id,
@@ -812,13 +866,13 @@ class PostgresKnowledgeBase:
                         SELECT
                             chunk.id,
                             ts_rank_cd(
-                                chunk.lexical_search_vector,
+                                {lexical_vector},
                                 websearch_to_tsquery('portuguese', :question)
                             ) AS rank_cd,
                             ROW_NUMBER() OVER (
                                 ORDER BY
                                     ts_rank_cd(
-                                        chunk.lexical_search_vector,
+                                        {lexical_vector},
                                         websearch_to_tsquery('portuguese', :question)
                                     ) DESC,
                                     chunk.id
@@ -834,11 +888,11 @@ class PostgresKnowledgeBase:
                                 )
                                 OR generation.id = CAST(:generation_id AS uuid)
                             )
-                        WHERE chunk.lexical_search_vector
+                        WHERE {lexical_vector}
                             @@ websearch_to_tsquery('portuguese', :question)
                         ORDER BY
                             ts_rank_cd(
-                                chunk.lexical_search_vector,
+                                {lexical_vector},
                                 websearch_to_tsquery('portuguese', :question)
                             ) DESC,
                             chunk.id
@@ -879,12 +933,8 @@ class PostgresKnowledgeBase:
                         ranked.vector_rank,
                         ranked.text_rank_cd,
                         ranked.text_rank,
-                        to_tsvector('portuguese', document.title)
-                            @@ websearch_to_tsquery('portuguese', :question)
-                            AS title_match,
-                        to_tsvector('portuguese', chunk.section)
-                            @@ websearch_to_tsquery('portuguese', :question)
-                            AS section_match,
+                        {title_match} AS title_match,
+                        {section_match} AS section_match,
                         document.index_generation
                     FROM ranked
                     JOIN kb_chunks AS chunk ON chunk.id = ranked.id
@@ -896,9 +946,10 @@ class PostgresKnowledgeBase:
                 {
                     "embedding": embedding_literal,
                     "question": retrieval_query.lexical_text,
+                    "title_question": retrieval_query.title_text,
                     "generation_id": generation_id,
                     "candidate_limit": candidate_limit,
-                    "result_limit": self._result_limit,
+                    "result_limit": result_limit,
                 },
             )
 
@@ -927,7 +978,9 @@ class PostgresKnowledgeBase:
                     title_match=bool(row.title_match),
                     section_match=bool(row.section_match),
                     rrf_score=float(row.rrf_score),
-                    retrieval_profile=RETRIEVAL_PROFILE,
+                    retrieval_profile=index_profile.retrieval_identifier(
+                        query_strategy_version=retrieval_query.strategy_version
+                    ),
                     index_generation=row.index_generation,
                     index_profile=index_profile.identifier,
                 ),

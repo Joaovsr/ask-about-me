@@ -451,16 +451,78 @@ def test_support_gate_accepts_a_published_title_without_a_strong_vector_neighbor
     assert decision.reasons == ("published_title_match",)
 
 
+def test_support_gate_rejects_a_semantic_neighbor_for_a_generic_tutorial_request() -> None:
+    question = "Ensine como criar uma medida DAX no Power BI."
+    evidence = asyncio.run(CaseStudyKnowledgeBase().search_my_work(question, ()))
+    neighbor = replace(
+        evidence[0],
+        signals=replace(
+            evidence[0].signals,
+            vector_distance=0.443,
+            vector_similarity=0.557,
+        ),
+    )
+
+    decision = CalibratedEvidenceSupportEvaluator().evaluate(
+        question=question,
+        retrieval_query=DeterministicRetrievalQueryBuilder().build(question, ()),
+        chunks=(neighbor,),
+        retrieval_profile=neighbor.signals.retrieval_profile,
+    )
+
+    assert decision.supported is False
+
+
+def test_support_gate_accepts_a_supported_cross_language_question() -> None:
+    question = "What did João build for external job candidates?"
+    evidence = asyncio.run(CaseStudyKnowledgeBase().search_my_work(question, ()))
+    neighbor = replace(
+        evidence[0],
+        signals=replace(
+            evidence[0].signals,
+            vector_distance=0.5,
+            vector_similarity=0.5,
+        ),
+    )
+
+    decision = CalibratedEvidenceSupportEvaluator().evaluate(
+        question=question,
+        retrieval_query=DeterministicRetrievalQueryBuilder().build(question, ()),
+        chunks=(neighbor,),
+        retrieval_profile=neighbor.signals.retrieval_profile,
+    )
+
+    assert decision.supported is True
+
+
 def test_support_gate_rejects_thresholds_for_a_different_retrieval_profile() -> None:
     question = "Portal do Candidato"
     evidence = asyncio.run(CaseStudyKnowledgeBase().search_my_work(question, ()))
 
     with pytest.raises(RuntimeError, match="incompatible with retrieval profile"):
-        CalibratedEvidenceSupportEvaluator(retrieval_profile="candidate-profile-v2").evaluate(
+        CalibratedEvidenceSupportEvaluator().evaluate(
             question=question,
             retrieval_query=DeterministicRetrievalQueryBuilder().build(question, ()),
-            chunks=evidence,
-            retrieval_profile=evidence[0].signals.retrieval_profile,
+            chunks=(
+                replace(
+                    evidence[0],
+                    signals=replace(
+                        evidence[0].signals,
+                        retrieval_profile=(
+                            "retrieval=hybrid-rrf-v2;query=deterministic-query-v2;"
+                            "embedding=openai/text-embedding-3-large/3072;"
+                            "chunker=section-token-v1:text-embedding-3-large:350:500:50;"
+                            "locale=pt-BR;lexical=weighted-portuguese-v1"
+                        ),
+                    ),
+                ),
+            ),
+            retrieval_profile=(
+                "retrieval=hybrid-rrf-v2;query=deterministic-query-v2;"
+                "embedding=openai/text-embedding-3-large/3072;"
+                "chunker=section-token-v1:text-embedding-3-large:350:500:50;"
+                "locale=pt-BR;lexical=weighted-portuguese-v1"
+            ),
         )
 
 

@@ -12,6 +12,7 @@ from ask_about_me.db import Database
 from ask_about_me.knowledge_base import IndexProfile, PostgresKnowledgeBase
 from ask_about_me.providers import LocalHashEmbeddingProvider
 from ask_about_me.rag import (
+    CALIBRATED_RETRIEVAL_PROFILE,
     CalibratedEvidenceSupportEvaluator,
     ConversationMessage,
     ConversationRole,
@@ -59,8 +60,15 @@ class RetrievalInspector:
                 generation_id=generation_id,
             )
         )
+        profile = await self.knowledge_base.get_index_profile(generation_id=generation_id)
         retrieval_profile = (
-            chunks[0].signals.retrieval_profile if chunks else "hybrid-v2:weighted-lexical-v1"
+            chunks[0].signals.retrieval_profile
+            if chunks
+            else (
+                profile.retrieval_identifier(query_strategy_version=query.strategy_version)
+                if profile is not None
+                else CALIBRATED_RETRIEVAL_PROFILE
+            )
         )
         support = CalibratedEvidenceSupportEvaluator().evaluate(
             question=question,
@@ -68,7 +76,6 @@ class RetrievalInspector:
             chunks=chunks,
             retrieval_profile=retrieval_profile,
         )
-        profile = await self.knowledge_base.get_index_profile(generation_id=generation_id)
         resolved_generation = (
             generation_id
             if generation_id is not None

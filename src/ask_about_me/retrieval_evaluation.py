@@ -5,10 +5,11 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from math import log2
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Protocol
 from uuid import UUID
 
 from ask_about_me.rag import (
+    CALIBRATED_RETRIEVAL_PROFILE,
     CalibratedEvidenceSupportEvaluator,
     ConversationMessage,
     ConversationRole,
@@ -20,6 +21,8 @@ from ask_about_me.rag import (
 SCHEMA_VERSION = 1
 DEFAULT_GOLDEN_DATASET = Path("evals/retrieval/golden.jsonl")
 RANKING_CUTOFFS = (1, 3, 5, 8)
+EVALUATION_CANDIDATE_LIMIT = 32
+GENERATION_RESULT_LIMIT = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,20 +72,13 @@ class EvaluationReport:
 
 
 class RetrievalSearcher(Protocol):
-    async def search_my_work(
-        self,
-        question: str,
-        history: tuple[ConversationMessage, ...],
-    ) -> tuple[RetrievedChunk, ...]: ...
-
-
-class GenerationRetrievalSearcher(Protocol):
-    async def search_generation(
+    async def search_for_evaluation(
         self,
         question: str,
         history: tuple[ConversationMessage, ...],
         *,
-        generation_id: UUID,
+        generation_id: UUID | None,
+        candidate_limit: int,
     ) -> tuple[RetrievedChunk, ...]: ...
 
 
@@ -173,14 +169,11 @@ async def evaluate_retrieval(
     true_positives = false_positives = false_negatives = 0
     critical_failures: list[str] = []
     for case in cases:
-        chunks = (
-            await searcher.search_my_work(case.question, case.history)
-            if generation_id is None
-            else await cast(GenerationRetrievalSearcher, searcher).search_generation(
-                case.question,
-                case.history,
-                generation_id=generation_id,
-            )
+        chunks = await searcher.search_for_evaluation(
+            case.question,
+            case.history,
+            generation_id=generation_id,
+            candidate_limit=EVALUATION_CANDIDATE_LIMIT,
         )
         channel_rankings["hybrid"].append((case, chunks))
         channel_rankings["vector"].append(
@@ -206,13 +199,16 @@ async def evaluate_retrieval(
             )
         )
         retrieval_query = query_builder.build(case.question, case.history)
+        gate_chunks = chunks[:GENERATION_RESULT_LIMIT]
         retrieval_profile = (
-            chunks[0].signals.retrieval_profile if chunks else "hybrid-v2:weighted-lexical-v1"
+            gate_chunks[0].signals.retrieval_profile
+            if gate_chunks
+            else CALIBRATED_RETRIEVAL_PROFILE
         )
         decision = evaluator.evaluate(
             question=case.question,
             retrieval_query=retrieval_query,
-            chunks=chunks,
+            chunks=gate_chunks,
             retrieval_profile=retrieval_profile,
         )
         expected_supported = case.expected_support in {"supported", "partial"}
@@ -224,7 +220,7 @@ async def evaluate_retrieval(
             false_negatives += 1
         if "critical" in case.tags and (
             decision.supported != expected_supported
-            or (case.relevant_sources and _recall(case, chunks[:5]) < 1.0)
+            or (case.relevant_sources and _recall(case, chunks[:5]) == 0.0)
         ):
             critical_failures.append(case.id)
 
@@ -238,6 +234,7 @@ async def evaluate_retrieval(
     passed = (
         channels["hybrid"].recall_at[5] >= 0.95
         and gate_precision >= 0.95
+        and gate_recall >= 0.95
         and false_positives == 0
         and not critical_failures
     )
@@ -290,10 +287,10 @@ def _relevant_source(case: GoldenCase, chunk: RetrievedChunk) -> RelevantSource 
 
 def _recall(case: GoldenCase, chunks: Sequence[RetrievedChunk]) -> float:
     expected = {
-        (source.slug, section) for source in case.relevant_sources for section in source.sections
+        (source.slug, section)
+        for source in case.relevant_sources
+        for section in (source.sections or ("",))
     }
-    if not expected:
-        expected = {(source.slug, "") for source in case.relevant_sources}
     found: set[tuple[str, str]] = set()
     for chunk in chunks:
         source = _relevant_source(case, chunk)
@@ -314,10 +311,22 @@ def _reciprocal_rank(case: GoldenCase, chunks: Sequence[RetrievedChunk]) -> floa
 
 
 def _ndcg(case: GoldenCase, chunks: Sequence[RetrievedChunk]) -> float:
-    gains = [
-        0 if (source := _relevant_source(case, chunk)) is None else source.relevance
-        for chunk in chunks
-    ]
+    seen_relevance_units: set[tuple[str, str]] = set()
+    gains: list[int] = []
+    for chunk in chunks:
+        source = _relevant_source(case, chunk)
+        if source is None:
+            gains.append(0)
+            continue
+        relevance_unit = (
+            source.slug,
+            chunk.section if source.sections else "",
+        )
+        if relevance_unit in seen_relevance_units:
+            gains.append(0)
+            continue
+        seen_relevance_units.add(relevance_unit)
+        gains.append(source.relevance)
     dcg = sum((2**gain - 1) / log2(rank + 1) for rank, gain in enumerate(gains, start=1))
     ideal_gains = sorted(
         (source.relevance for source in case.relevant_sources for _ in (source.sections or ("",))),

@@ -5,6 +5,14 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+RETRIEVAL_PIPELINE_VERSION = "hybrid-rrf-v2"
+CALIBRATED_RETRIEVAL_PROFILE = (
+    "retrieval=hybrid-rrf-v2;query=deterministic-query-v2;"
+    "embedding=openai/text-embedding-3-small/1536;"
+    "chunker=section-token-v1:text-embedding-3-small:350:500:50;"
+    "locale=pt-BR;lexical=weighted-portuguese-v1"
+)
+
 
 class Locale(StrEnum):
     PT_BR = "pt-BR"
@@ -61,7 +69,8 @@ class RetrievalQuery:
     lexical_text: str
     history_used: tuple[ConversationMessage, ...]
     history_reason: str | None
-    strategy_version: str = "deterministic-query-v1"
+    title_text: str = ""
+    strategy_version: str = "deterministic-query-v2"
 
 
 @dataclass(frozen=True)
@@ -74,7 +83,7 @@ class RetrievalSignals:
     title_match: bool
     section_match: bool
     rrf_score: float
-    retrieval_profile: str = "hybrid-v2:weighted-lexical-v1"
+    retrieval_profile: str = CALIBRATED_RETRIEVAL_PROFILE
     index_generation: UUID | None = None
     index_profile: str = ""
 
@@ -232,6 +241,27 @@ class DeterministicRetrievalQueryBuilder:
         r"\b(?:fale|conte|tell\s+me|talk)\s+(?:sobre|about)\b",
         re.IGNORECASE,
     )
+    _title_term = re.compile(r"\b[A-ZÁÀÂÃÉÊÍÓÔÕÚÜÇ][\wÀ-ÿ-]*\b")
+    _title_noise = frozenset(
+        {
+            "and",
+            "como",
+            "conte",
+            "e",
+            "ensine",
+            "fale",
+            "how",
+            "qual",
+            "quais",
+            "que",
+            "quanto",
+            "tell",
+            "what",
+            "which",
+            "who",
+            "write",
+        }
+    )
 
     def build(
         self,
@@ -256,28 +286,51 @@ class DeterministicRetrievalQueryBuilder:
             self._lexical_terms(stripped_question),
         )
         lexical_text = " OR ".join(part for part in lexical_parts if part).strip()
+        title_parts = tuple(self._title_terms(part) for part in lexical_parts)
+        title_text = " OR ".join(part for part in title_parts if part).strip()
         return RetrievalQuery(
             original_question=stripped_question,
             embedding_text="\n".join(embedding_parts),
             lexical_text=lexical_text or stripped_question,
             history_used=history_used,
             history_reason=history_reason,
+            title_text=title_text,
         )
 
     def _lexical_terms(self, value: str) -> str:
         return " ".join(self._navigation.sub(" ", value).split())
 
+    def _title_terms(self, value: str) -> str:
+        return " ".join(
+            term
+            for term in self._title_term.findall(value)
+            if term.casefold() not in self._title_noise
+        )
+
 
 class CalibratedEvidenceSupportEvaluator:
     """Decide whether retrieved evidence supports generation using raw retrieval signals."""
+
+    _generic_task_request = re.compile(
+        r"^\s*(?:por favor[,\s]+)?(?:"
+        r"implemente\b|ensine\s+como\b|escreva\s+(?:um|uma)\s+(?:tutorial|guia)\b"
+        r")|"
+        r"^\s*(?:please[,\s]+)?(?:"
+        r"implement\b|teach\s+(?:me\s+)?how\b|"
+        r"write\s+(?:a|an)\s+(?:tutorial|guide)\b"
+        r")|"
+        r"^\s*(?:como|how\s+(?:do|can)\s+i)\s+"
+        r"(?:criar|implementar|build|create|implement)\b",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
         *,
         minimum_vector_similarity: float = 0.45,
         minimum_text_rank_cd: float = 0.05,
-        rule_version: str = "support-v1",
-        retrieval_profile: str = "hybrid-v2:weighted-lexical-v1",
+        rule_version: str = "support-v2",
+        retrieval_profile: str = CALIBRATED_RETRIEVAL_PROFILE,
         generation_limit: int = 6,
         per_document_limit: int = 2,
     ) -> None:
@@ -296,7 +349,10 @@ class CalibratedEvidenceSupportEvaluator:
         chunks: tuple[RetrievedChunk, ...],
         retrieval_profile: str,
     ) -> SupportDecision:
-        del question, retrieval_query
+        if f"query={retrieval_query.strategy_version};" not in retrieval_profile:
+            raise RuntimeError(
+                "retrieval query strategy does not match the profile that produced the chunks"
+            )
         observed_profiles = {
             retrieval_profile,
             *(chunk.signals.retrieval_profile for chunk in chunks),
@@ -308,7 +364,12 @@ class CalibratedEvidenceSupportEvaluator:
                 f"support thresholds are incompatible with retrieval profile(s): {profiles}"
             )
 
-        approved = tuple(chunk for chunk in chunks if self._supports_generation(chunk))
+        generic_task_request = self._generic_task_request.search(question) is not None
+        approved = (
+            ()
+            if generic_task_request
+            else tuple(chunk for chunk in chunks if self._supports_generation(chunk))
+        )
         selected = self._select_context(approved)
         similarities = [
             chunk.signals.vector_similarity
@@ -325,6 +386,8 @@ class CalibratedEvidenceSupportEvaluator:
             for chunk in chunks
         )
         reasons: list[str] = []
+        if generic_task_request:
+            reasons.append("generic_task_request")
         if has_title_match:
             reasons.append("published_title_match")
         if text_ranks and max(text_ranks) >= self._minimum_text_rank_cd:

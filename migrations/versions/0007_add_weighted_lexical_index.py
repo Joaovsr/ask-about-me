@@ -51,12 +51,6 @@ def upgrade() -> None:
         ON kb_chunks USING GIN (lexical_search_vector)
         """
     )
-    op.execute(
-        """
-        UPDATE kb_index_generations
-        SET lexical_strategy_version = 'weighted-portuguese-v1'
-        """
-    )
 
 
 def downgrade() -> None:

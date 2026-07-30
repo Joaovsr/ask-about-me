@@ -175,6 +175,10 @@ Cada resultado inclui pelo menos:
 Esses sinais são internos e observáveis no inspector, não probabilidades nem parte do
 contrato de `/ask`. RRF serve apenas para ordenação. Chunk size, overlap, top-K, pesos e
 thresholds são calibrados no Golden Dataset e versionados com o perfil ao qual se aplicam.
+O gate também pode usar um sinal negativo de intenção para pedidos explícitos de
+implementação ou tutorial genérico. Esse sinal roda somente depois do retrieval e não é
+uma allowlist de produtos: nomes publicados continuam sendo reconhecidos pelos próprios
+sinais textual e vetorial.
 
 V1 usa um único provedor externo para geração e embeddings. Reranking só pode executar localmente ou pelo provedor já escolhido e apenas se uma avaliação mostrar ganho relevante sobre pgvector e full-text search. Adicionar outro serviço exige revisão explícita do ADR 0002.
 

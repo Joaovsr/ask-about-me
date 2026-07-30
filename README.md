@@ -88,8 +88,10 @@ modelo gerador. O resultado mostra pergunta original, consulta autônoma, histó
 geração e perfil do índice, decisão do gate de suporte e, para cada chunk, distância e
 similaridade vetorial, ranks por canal, `ts_rank_cd`, matches em título/seção e RRF. O Chat
 embutido executa retrieval antes de decidir se existe suporte; vizinhos fracos não chegam
-à geração. Use `ARGS=--json` para saída estruturada. Para reproduzir um follow-up, repita
-`--history`, por exemplo:
+à geração. A consulta mantém termos de título separados do texto amplo, e pedidos
+explícitos para implementar ou ensinar um tutorial genérico são recusados após o
+retrieval, mesmo quando citam uma tecnologia presente no portfólio. Use `ARGS=--json`
+para saída estruturada. Para reproduzir um follow-up, repita `--history`, por exemplo:
 
 ```bash
 .venv/bin/python -m ask_about_me.inspect_retrieval 'E qual foi o resultado?' \
@@ -97,11 +99,16 @@ embutido executa retrieval antes de decidir se existe suporte; vizinhos fracos n
 ```
 
 O Golden Dataset em `evals/retrieval/golden.jsonl` mede separadamente os canais vetorial,
-lexical e híbrido, além da precision/recall do gate, sem chamar a geração:
+lexical e híbrido, além da precision/recall do gate, sem chamar a geração. A avaliação
+mantém até 32 candidatos por canal para não confundir o top 8 usado em produção com o
+universo necessário para medir cada ranking:
 
 ```bash
 make evaluate-retrieval ARGS='--split holdout'
 ```
+
+A calibração e o holdout OpenAI registrados para o primeiro perfil ponderado estão em
+[`evals/retrieval/calibration-2026-07-30.md`](evals/retrieval/calibration-2026-07-30.md).
 
 Uma reindexação OpenAI normal prepara, avalia e ativa a geração candidata. Para inspecionar
 o candidato antes da ativação, separe as etapas e preserve o ID da geração ativa esperado:
@@ -112,6 +119,10 @@ make evaluate-retrieval ARGS='--split holdout --generation UUID_DA_CANDIDATA'
 .venv/bin/python -m ask_about_me.reindex \
   --activate UUID_DA_CANDIDATA --expected-active UUID_DA_GERACAO_ATIVA
 ```
+
+A migration do índice lexical não muda o perfil das gerações existentes. Elas continuam
+pesquisáveis pelo vetor textual legado durante o rollback; somente gerações novas usam
+título, seção e corpo ponderados e podem ser avaliadas com os thresholds desse perfil.
 
 Para usar a pipeline real da OpenAI, copie as configurações de `.env.example`, preencha
 `AAM_OPENAI_API_KEY` somente no `.env` ignorado pelo Git, reindexe o conteúdo e inicie a
