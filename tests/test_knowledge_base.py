@@ -232,6 +232,17 @@ def test_retrieval_query_does_not_inherit_history_for_a_complete_topic_switch() 
     assert query.embedding_text == "Qual o presidente do Brasil?"
     assert "Portal" not in query.lexical_text
 
+    prefixed_query = knowledge_base.build_retrieval_query(
+        "E o presidente do Brasil?",
+        (
+            ConversationMessage(
+                role=ConversationRole.USER,
+                content="Como funciona o Portal do Candidato?",
+            ),
+        ),
+    )
+    assert prefixed_query.history_used == ()
+
 
 def test_search_my_work_combines_vector_and_portuguese_full_text_search(
     test_database_url: str,

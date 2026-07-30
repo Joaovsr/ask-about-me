@@ -220,7 +220,7 @@ class DeterministicRetrievalQueryBuilder:
     """Build a standalone retrieval query without allowing history to mask topic changes."""
 
     _elliptical = re.compile(
-        r"^(?:e|and)\b|"
+        r"^(?:e|and)\s+(?:qual|quais|quanto|como|what|which|how)\b|"
         r"\b(?:nesse|nessa|neste|nesta|dele|dela|disso|desse|dessa|"
         r"that|this|it|its|there)\b|"
         r"^(?:qual|quais|what|which)\s+(?:foi|foram|era|were|was|is|are)\b",

@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from uuid import UUID
 
 from ask_about_me.rag import DocumentType, RetrievalSignals, RetrievedChunk
@@ -6,6 +7,7 @@ from ask_about_me.retrieval_evaluation import (
     GoldenCase,
     RelevantSource,
     evaluate_retrieval,
+    load_golden_dataset,
 )
 
 
@@ -98,3 +100,19 @@ def test_evaluator_reports_retrieval_and_support_metrics_without_generation() ->
     assert report.gate.supported_precision == 1.0
     assert report.gate.supported_recall == 1.0
     assert report.generation_calls == 0
+
+
+def test_versioned_golden_dataset_covers_calibration_holdout_and_critical_cases() -> None:
+    cases = load_golden_dataset(Path("evals/retrieval/golden.jsonl"))
+
+    assert len(cases) >= 20
+    assert {case.split for case in cases} == {"calibration", "holdout"}
+    assert {
+        "pt-audit-president",
+        "pt-audit-power-bi",
+        "pt-audit-candidate-portal",
+        "pt-audit-people-platform",
+    } <= {case.id for case in cases}
+    assert any(case.locale == "en-US" for case in cases)
+    assert any("follow-up" in case.tags for case in cases)
+    assert any("semantic-hard-negative" in case.tags for case in cases)

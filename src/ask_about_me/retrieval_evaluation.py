@@ -65,6 +65,7 @@ class EvaluationReport:
     gate: GateMetrics
     generation_calls: int
     passed: bool
+    critical_failures: tuple[str, ...]
 
 
 class RetrievalSearcher(Protocol):
@@ -170,6 +171,7 @@ async def evaluate_retrieval(
         "hybrid": [],
     }
     true_positives = false_positives = false_negatives = 0
+    critical_failures: list[str] = []
     for case in cases:
         chunks = (
             await searcher.search_my_work(case.question, case.history)
@@ -220,6 +222,11 @@ async def evaluate_retrieval(
             false_positives += 1
         elif expected_supported:
             false_negatives += 1
+        if "critical" in case.tags and (
+            decision.supported != expected_supported
+            or (case.relevant_sources and _recall(case, chunks[:5]) < 1.0)
+        ):
+            critical_failures.append(case.id)
 
     precision_denominator = true_positives + false_positives
     recall_denominator = true_positives + false_negatives
@@ -229,7 +236,10 @@ async def evaluate_retrieval(
         channel: _channel_metrics(rankings) for channel, rankings in channel_rankings.items()
     }
     passed = (
-        channels["hybrid"].recall_at[5] >= 0.95 and gate_precision >= 0.95 and false_positives == 0
+        channels["hybrid"].recall_at[5] >= 0.95
+        and gate_precision >= 0.95
+        and false_positives == 0
+        and not critical_failures
     )
     return EvaluationReport(
         schema_version=SCHEMA_VERSION,
@@ -243,6 +253,7 @@ async def evaluate_retrieval(
         ),
         generation_calls=0,
         passed=passed,
+        critical_failures=tuple(critical_failures),
     )
 
 
@@ -309,7 +320,7 @@ def _ndcg(case: GoldenCase, chunks: Sequence[RetrievedChunk]) -> float:
     ]
     dcg = sum((2**gain - 1) / log2(rank + 1) for rank, gain in enumerate(gains, start=1))
     ideal_gains = sorted(
-        (source.relevance for source in case.relevant_sources),
+        (source.relevance for source in case.relevant_sources for _ in (source.sections or ("",))),
         reverse=True,
     )[: len(chunks)]
     ideal = sum((2**gain - 1) / log2(rank + 1) for rank, gain in enumerate(ideal_gains, start=1))

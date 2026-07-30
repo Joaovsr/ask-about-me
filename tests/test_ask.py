@@ -1,5 +1,8 @@
+import asyncio
+from dataclasses import replace
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -8,7 +11,9 @@ from ask_about_me.config import Settings
 from ask_about_me.openai_generation import AnswerGenerationUnavailableError
 from ask_about_me.rag import (
     AnswerGenerationRequest,
+    CalibratedEvidenceSupportEvaluator,
     ClaimType,
+    DeterministicRetrievalQueryBuilder,
     DocumentType,
     GeneratedAnswer,
     GeneratedClaim,
@@ -423,6 +428,40 @@ def test_ask_rejects_an_unsupported_question_after_retrieval_without_generation(
         ],
         "citations": [],
     }
+
+
+def test_support_gate_accepts_a_published_title_without_a_strong_vector_neighbor() -> None:
+    chunk = WeakKnowledgeBase()
+    evidence = asyncio.run(chunk.search_my_work("Portal do Candidato", ()))
+    title_match = replace(
+        evidence[0],
+        title="Portal do Candidato",
+        signals=replace(evidence[0].signals, title_match=True),
+    )
+    question = "Portal do Candidato"
+
+    decision = CalibratedEvidenceSupportEvaluator().evaluate(
+        question=question,
+        retrieval_query=DeterministicRetrievalQueryBuilder().build(question, ()),
+        chunks=(title_match,),
+        retrieval_profile=title_match.signals.retrieval_profile,
+    )
+
+    assert decision.supported is True
+    assert decision.reasons == ("published_title_match",)
+
+
+def test_support_gate_rejects_thresholds_for_a_different_retrieval_profile() -> None:
+    question = "Portal do Candidato"
+    evidence = asyncio.run(CaseStudyKnowledgeBase().search_my_work(question, ()))
+
+    with pytest.raises(RuntimeError, match="incompatible with retrieval profile"):
+        CalibratedEvidenceSupportEvaluator(retrieval_profile="candidate-profile-v2").evaluate(
+            question=question,
+            retrieval_query=DeterministicRetrievalQueryBuilder().build(question, ()),
+            chunks=evidence,
+            retrieval_profile=evidence[0].signals.retrieval_profile,
+        )
 
 
 def test_ask_rejects_a_generated_claim_with_multiple_assertions() -> None:
