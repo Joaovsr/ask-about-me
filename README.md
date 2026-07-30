@@ -56,12 +56,12 @@ O Postgres de desenvolvimento fica restrito a `127.0.0.1:5432`, com pgvector hab
   conteúdo responde que a publicação está indisponível.
 
 A Knowledge Base recebe KB Docs projetados, divide suas seções em chunks e gera embeddings
-por uma interface substituível. A reindexação grava uma geração candidata inativa, verifica
-o retrieval nela e só então troca o ponteiro ativo em uma transação. Se a preparação ou a
-verificação falhar, a geração anterior continua pesquisável. A busca `search_my_work`
-combina pgvector e full-text search em português por Reciprocal Rank Fusion. Geração e
-embeddings ficam atrás de interfaces estreitas para permitir o spike de provedor sem
-alterar os módulos de Knowledge Base e RAG de Portfólio.
+por uma interface substituível. A reindexação grava uma geração candidata inativa, executa
+o holdout do Golden Dataset e só então troca o ponteiro ativo em uma transação. Se a
+preparação ou a avaliação falhar, a geração anterior continua pesquisável. A busca
+`search_my_work` combina pgvector e full-text search ponderado em português por Reciprocal
+Rank Fusion (RRF). Título, seção e corpo recebem pesos lexicais distintos; RRF ordena
+candidatos, mas não é interpretado como confiança ou suporte.
 
 O seed versionado inclui um Case Study da plataforma de gestão de pessoas com IA e o
 snapshot inicial de perfil, experiências e projetos do portfólio. A
@@ -75,6 +75,43 @@ somente as origens alteradas e preserva os demais KB Docs ativos, independenteme
 `make seed-dev` é idempotente e usa embeddings hash locais apenas para desenvolvimento.
 Eles não substituem a avaliação nem os modelos do provedor de produção; ao configurar o
 provedor escolhido, o conteúdo deve ser reindexado antes de servir tráfego.
+
+Para inspecionar somente o retrieval, sem chamar a geração de resposta da OpenAI, execute:
+
+```bash
+make inspect-retrieval QUESTION='Qual o presidente do Brasil?'
+```
+
+O comando detecta o provedor do índice ativo: para um índice OpenAI, envia somente a
+consulta para gerar seu embedding e consulta o Postgres; os chunks nunca são enviados ao
+modelo gerador. O resultado mostra pergunta original, consulta autônoma, histórico usado,
+geração e perfil do índice, decisão do gate de suporte e, para cada chunk, distância e
+similaridade vetorial, ranks por canal, `ts_rank_cd`, matches em título/seção e RRF. O Chat
+embutido executa retrieval antes de decidir se existe suporte; vizinhos fracos não chegam
+à geração. Use `ARGS=--json` para saída estruturada. Para reproduzir um follow-up, repita
+`--history`, por exemplo:
+
+```bash
+.venv/bin/python -m ask_about_me.inspect_retrieval 'E qual foi o resultado?' \
+  --history 'user:Fale sobre o Fictor360 AI.'
+```
+
+O Golden Dataset em `evals/retrieval/golden.jsonl` mede separadamente os canais vetorial,
+lexical e híbrido, além da precision/recall do gate, sem chamar a geração:
+
+```bash
+make evaluate-retrieval ARGS='--split holdout'
+```
+
+Uma reindexação OpenAI normal prepara, avalia e ativa a geração candidata. Para inspecionar
+o candidato antes da ativação, separe as etapas e preserve o ID da geração ativa esperado:
+
+```bash
+.venv/bin/python -m ask_about_me.reindex --stage-only
+make evaluate-retrieval ARGS='--split holdout --generation UUID_DA_CANDIDATA'
+.venv/bin/python -m ask_about_me.reindex \
+  --activate UUID_DA_CANDIDATA --expected-active UUID_DA_GERACAO_ATIVA
+```
 
 Para usar a pipeline real da OpenAI, copie as configurações de `.env.example`, preencha
 `AAM_OPENAI_API_KEY` somente no `.env` ignorado pelo Git, reindexe o conteúdo e inicie a
@@ -94,8 +131,8 @@ de sessão seguro em produção HTTPS.
 O adapter usa `text-embedding-3-small` com 1.536 dimensões por padrão e envia os chunks em
 lotes. O chunker preserva os limites das seções, prefere fronteiras de parágrafo e frase e
 usa inicialmente alvo de 350 tokens, máximo de 500 e overlap de até 50 tokens. Cada geração
-do índice registra provider, modelo, dimensões e versão do chunker; uma configuração
-incompatível exige reindexação em vez de misturar vetores.
+do índice registra provider, modelo, dimensões, versão do chunker e estratégia lexical; uma
+configuração incompatível falha explicitamente em vez de misturar vetores ou thresholds.
 
 A geração usa a Responses API com Structured Outputs e `gpt-5.6-sol` por padrão. O modelo
 recebe apenas a pergunta, o histórico efêmero e os chunks recuperados como dados não
@@ -120,6 +157,8 @@ make check
 - Essays sustentam opiniões técnicas, não entregas realizadas.
 - Toda afirmação factual substantiva precisa de citação.
 - Sem evidência suficiente, o sistema responde parcialmente ou declara a limitação.
+- Toda pergunta executa retrieval antes do gate de suporte; sem evidência aprovada, a
+  geração não é chamada.
 
 ## Documentação
 

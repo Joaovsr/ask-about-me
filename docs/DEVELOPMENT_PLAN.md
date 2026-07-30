@@ -325,6 +325,10 @@ Perguntas livres, prompts e follow-ups usam o fluxo real; refresh remove a conve
 
 Transformar retrieval quality em um gate verificável de lançamento, sem adotar complexidade apenas por sinal técnico.
 
+O refinamento executável desta fatia, incluindo Golden Dataset, observabilidade de scores,
+índice lexical estruturado, gate pós-retrieval, controle de histórico e rollout, está em
+[`RAG_RETRIEVAL_DEVELOPMENT_PLAN.md`](RAG_RETRIEVAL_DEVELOPMENT_PLAN.md).
+
 ### KB de lançamento
 
 - Importar e revisar o conjunto mínimo de Case Studies, Essays e Profile Docs necessário para cobrir as perguntas prioritárias.

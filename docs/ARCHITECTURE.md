@@ -84,9 +84,11 @@ Cada conteúdo indexável é convertido em um **KB Doc**:
 | Essay | `essay` | Opinião técnica; ainda não implementado. |
 
 O texto canônico indexado no V1 é `pt-BR`. A Knowledge Base cria chunks preservando
-seções e registra uma geração com perfil de embedding, modelo, dimensões e versão do
-chunker. A busca única `search_my_work` combina pgvector e full-text search em português
-por Reciprocal Rank Fusion.
+seções e registra uma geração com perfil de embedding, modelo, dimensões, chunker e
+estratégia lexical. O canal lexical materializa título com peso A, seção com peso B e corpo
+com peso D. A busca única `search_my_work` combina esse índice com pgvector por RRF,
+preservando os sinais brutos e a geração de origem. RRF ordena o pool; um gate separado
+decide se há suporte suficiente para geração.
 
 Uma publicação somente substitui os documentos de origem afetados e copia os documentos
 ativos não afetados para a nova geração. Isso mantém Case Studies e Profile Docs coexistindo
@@ -104,12 +106,18 @@ sequenceDiagram
 
   V->>UI: pergunta livre ou prompt sugerido
   UI->>API: pergunta, locale, histórico efêmero limitado
+  API->>API: consulta autônoma do turno atual
   API->>KB: recuperação híbrida
-  KB-->>API: chunks e metadados de origem
-  API->>OAI: pergunta + chunks não confiáveis
-  OAI-->>API: claims estruturados e IDs de chunks
-  API->>API: valida autoridade, atomicidade e citações
-  API-->>UI: resposta completa + cards de citação
+  KB-->>API: candidatos + sinais brutos + perfil
+  API->>API: gate de suporte + seleção de contexto
+  alt evidência insuficiente
+    API-->>UI: insufficient, sem geração
+  else evidência suficiente
+    API->>OAI: pergunta + chunks aprovados e não confiáveis
+    OAI-->>API: claims estruturados e IDs de chunks
+    API->>API: valida autoridade, atomicidade e citações
+    API-->>UI: resposta completa + cards de citação
+  end
 ```
 
 O backend não persiste conversas. O modelo recebe evidências recuperadas como dados não
@@ -149,8 +157,8 @@ perfil OpenAI para impedir a mistura de vetores incompatíveis.
 - Secrets ficam somente no backend, por meio de `.env` ignorado pelo Git e prefixo `AAM_`.
 - OpenAI é o primeiro provedor de embedding e geração; interfaces estreitas permitem trocar
   o adapter sem reescrever Knowledge Base ou RAG.
-- O Golden Dataset e Langfuse fazem parte da arquitetura alvo de qualidade e observabilidade;
-  sua instrumentação ainda é um trabalho pendente.
+- O Golden Dataset versionado avalia retrieval e gate contra a geração ativa ou candidata.
+  Uma reindexação OpenAI só ativa o candidato após o holdout; Langfuse continua planejado.
 - A publicação é síncrona no V1. Caso o tempo de publicação se torne inaceitável, qualquer
   fila ou estado pendente exige revisar os ADRs 0004 e 0007.
 
@@ -160,4 +168,4 @@ perfil OpenAI para impedir a mistura de vetores incompatíveis.
 2. Mídia persistente com identidade, ordem e alt text localizado.
 3. Migração de Skills, Education e Certifications para o snapshot publicado.
 4. Essays, Suggested Prompts e páginas públicas versionadas para todas as citações.
-5. Golden Dataset automatizado e traces/redação no Langfuse.
+5. Traces e redação no Langfuse.

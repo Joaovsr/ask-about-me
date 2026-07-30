@@ -153,11 +153,12 @@ Exclusões obedecem à mesma regra e removem os derivados da KB junto com o cont
 
 ## 7. Retrieval
 
-O módulo Knowledge Base expõe uma única operação `search_my_work`. Sua implementação inicial combina:
+O módulo Knowledge Base expõe uma única operação `search_my_work`. Sua implementação combina:
 
 - Busca vetorial com pgvector.
-- Full-text search do Postgres para o conteúdo em português.
-- Deduplicação e ranking dos resultados.
+- Full-text search ponderado do Postgres para título, seção e corpo em português.
+- Deduplicação e ranking híbrido dos candidatos por RRF.
+- Gate de suporte pós-retrieval calibrado no Golden Dataset.
 
 Cada resultado inclui pelo menos:
 
@@ -167,9 +168,13 @@ Cada resultado inclui pelo menos:
 - Título e seção.
 - Trecho original.
 - Identidade e URL do conteúdo público de origem.
-- Score interno para ranking.
+- Distância e similaridade de cosseno, ranks por canal, `ts_rank_cd`, matches em
+  título/seção e score RRF.
+- Geração e perfil do índice.
 
-Scores não precisam ser exibidos ao visitante. Chunk size, overlap, top-K, pesos e thresholds são parâmetros calibrados com uma coleção de perguntas esperadas, não contratos públicos.
+Esses sinais são internos e observáveis no inspector, não probabilidades nem parte do
+contrato de `/ask`. RRF serve apenas para ordenação. Chunk size, overlap, top-K, pesos e
+thresholds são calibrados no Golden Dataset e versionados com o perfil ao qual se aplicam.
 
 V1 usa um único provedor externo para geração e embeddings. Reranking só pode executar localmente ou pelo provedor já escolhido e apenas se uma avaliação mostrar ganho relevante sobre pgvector e full-text search. Adicionar outro serviço exige revisão explícita do ADR 0002.
 
@@ -178,13 +183,21 @@ V1 usa um único provedor externo para geração e embeddings. Reranking só pod
 O backend usa FastAPI e orquestra explicitamente o fluxo:
 
 1. Validar pergunta, locale e histórico recebido.
-2. Recuperar evidências novamente para a pergunta atual.
-3. Pedir ao modelo itens ordenados, cada claim contendo uma única afirmação substantiva e IDs de chunks recuperados.
-4. Validar todos os IDs, a atomicidade do claim e a autoridade permitida para todas as suas citações.
-5. Hidratar no servidor títulos, excerpts, versões e URLs das citações válidas.
-6. Retornar a resposta completa com claims, limitações e cards deduplicados.
+2. Construir uma consulta autônoma para o turno atual, usando somente a última pergunta do
+   visitante quando o turno for realmente elíptico.
+3. Recuperar candidatos e seus sinais brutos no índice ativo.
+4. Aplicar o gate de suporte e selecionar contexto com diversidade limitada por KB Doc.
+5. Sem suporte, retornar `insufficient` sem chamar o gerador.
+6. Com suporte, pedir ao modelo itens ordenados, cada claim contendo uma única afirmação
+   substantiva e IDs de chunks aprovados.
+7. Validar todos os IDs, a atomicidade do claim e a autoridade permitida.
+8. Hidratar no servidor títulos, excerpts, versões e URLs das citações válidas.
+9. Retornar a resposta completa com claims, limitações e cards deduplicados.
 
-O histórico ajuda a interpretar referências como "e nesse projeto?", mas mensagens anteriores do assistente nunca são evidência. O servidor não persiste o histórico.
+O histórico ajuda a interpretar referências como "e nesse projeto?", mas respostas do
+assistente nunca entram na consulta de retrieval nem constituem evidência. Uma pergunta
+completa ou mudança de assunto usa somente o turno atual. O servidor não persiste o
+histórico.
 
 O modelo não cria metadados de citação. Ele apenas referencia chunk IDs apresentados no contexto; todos os demais campos vêm do Postgres. Um claim não pode combinar afirmações independentes no mesmo texto. Se a saída não passar na validação após a tentativa de correção configurada, o backend retorna `insufficient` em vez de entregar claims sem suporte.
 

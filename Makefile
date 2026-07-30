@@ -8,7 +8,7 @@ export
 AAM_DATABASE_URL ?= postgresql+psycopg://ask_about_me:ask_about_me@localhost:5432/ask_about_me
 AAM_TEST_DATABASE_URL ?= postgresql+psycopg://ask_about_me:ask_about_me@localhost:5433/ask_about_me_test
 
-.PHONY: setup lock db-up db-down db-reset migrate seed-dev reindex-openai dev test lint typecheck format check
+.PHONY: setup lock db-up db-down db-reset migrate seed-dev reindex-openai inspect-retrieval evaluate-retrieval dev test lint typecheck format check
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -35,6 +35,12 @@ seed-dev: migrate
 
 reindex-openai: migrate
 	AAM_DATABASE_URL="$(AAM_DATABASE_URL)" $(BIN)/python -m ask_about_me.reindex
+
+inspect-retrieval:
+	AAM_DATABASE_URL="$(AAM_DATABASE_URL)" $(BIN)/python -m ask_about_me.inspect_retrieval "$(QUESTION)" $(ARGS)
+
+evaluate-retrieval:
+	AAM_DATABASE_URL="$(AAM_DATABASE_URL)" $(BIN)/python -m ask_about_me.retrieval_evaluation $(ARGS)
 
 dev: migrate
 	AAM_DATABASE_URL="$(AAM_DATABASE_URL)" $(BIN)/uvicorn ask_about_me.app:app --reload
